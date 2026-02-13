@@ -1,64 +1,95 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import Airtable from "airtable";
 import archiver from "archiver";
+import { list } from "@vercel/blob";
 
-const { AIRTABLE_TOKEN, AIRTABLE_BASE_ID, RUN_SECRET, CASE_PROFILES_TABLE } = process.env;
+const { RUN_SECRET } = process.env;
 
-if (!AIRTABLE_TOKEN || !AIRTABLE_BASE_ID || !CASE_PROFILES_TABLE) {
-  throw new Error("Missing required env vars.");
+if (!RUN_SECRET) throw new Error("Missing RUN_SECRET env var");
+
+function getHeader(req: VercelRequest, name: string): string | undefined {
+  const v = req.headers[name.toLowerCase()];
+  if (Array.isArray(v)) return v[0];
+  if (typeof v === "string") return v;
+  return undefined;
 }
 
-const airtable = new Airtable({ apiKey: AIRTABLE_TOKEN }).base(AIRTABLE_BASE_ID);
-
 function requireSecret(req: VercelRequest) {
-  const secret = req.headers["x-run-secret"];
-  if (!RUN_SECRET || secret !== RUN_SECRET) {
-    const err: any = new Error("Unauthorized");
+  const provided = getHeader(req, "x-run-secret");
+  if (!provided || provided !== RUN_SECRET) {
+    const err: any = new Error("AUTH_FAILED_RUN_SECRET");
     err.status = 401;
     throw err;
   }
+}
+
+async function fetchToBuffer(url: string): Promise<Buffer> {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Failed to fetch blob: ${r.status}`);
+  return Buffer.from(await r.arrayBuffer());
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     requireSecret(req);
 
+    const includeProfiles = String(req.query.includeProfiles ?? "0") === "1";
+
     res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="case-avatars.zip"`);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="case-blob-export.zip"`
+    );
 
     const archive = archiver("zip", { zlib: { level: 9 } });
-    archive.on("error", (err) => { throw err; });
+    archive.on("error", (err) => {
+      throw err;
+    });
     archive.pipe(res);
 
-    const table = airtable(CASE_PROFILES_TABLE!);
+    // 1) Avatars
+    {
+      let cursor: string | undefined = undefined;
+      do {
+        const page = await list({
+          prefix: "case-avatars/",
+          cursor,
+          limit: 1000
+        });
 
-    // Page through results (Airtable pages 100 at a time)
-    let offset: string | undefined = undefined;
-    do {
-      const page = await table.select({
-        pageSize: 100,
-        filterByFormula: `{Status} = "done"`
-      }).firstPage();
+        for (const b of page.blobs) {
+          const buf = await fetchToBuffer(b.url);
+          // Store inside zip without the prefix
+          const name = b.pathname.replace(/^case-avatars\//, "avatars/");
+          archive.append(buf, { name });
+        }
 
-      for (const r of page) {
-        const caseId = r.fields["CaseId"];
-        const url = r.fields["ImageUrl"];
-        if (!caseId || !url || typeof url !== "string") continue;
+        cursor = page.cursor ?? undefined;
+      } while (cursor);
+    }
 
-        const resp = await fetch(url);
-        if (!resp.ok) continue;
+    // 2) Profiles (optional)
+    if (includeProfiles) {
+      let cursor: string | undefined = undefined;
+      do {
+        const page = await list({
+          prefix: "case-profiles/",
+          cursor,
+          limit: 1000
+        });
 
-        const buf = Buffer.from(await resp.arrayBuffer());
-        archive.append(buf, { name: `${String(caseId).padStart(3, "0")}.png` });
-      }
+        for (const b of page.blobs) {
+          const buf = await fetchToBuffer(b.url);
+          const name = b.pathname.replace(/^case-profiles\//, "profiles/");
+          archive.append(buf, { name });
+        }
 
-      // Airtable SDK doesn't expose offset nicely via firstPage(),
-      // so for huge tables you'd switch to eachPage(). For ~355, this is fine if within 100.
-      offset = undefined;
-    } while (offset);
+        cursor = page.cursor ?? undefined;
+      } while (cursor);
+    }
 
     await archive.finalize();
   } catch (e: any) {
-    res.status(e?.status || 500).json({ ok: false, error: e?.message || "Unknown error" });
+    const status = e?.status || 500;
+    res.status(status).json({ ok: false, error: e?.message || "Unknown error", status });
   }
 }
