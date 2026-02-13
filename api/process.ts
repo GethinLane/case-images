@@ -9,20 +9,27 @@ const {
   OPENAI_API_KEY,
   RUN_SECRET,
   MAX_CASE_ID,
-  CASE_PROFILES_TABLE
+  CASE_PROFILES_TABLE,
 } = process.env;
 
 if (!AIRTABLE_TOKEN || !AIRTABLE_BASE_ID || !OPENAI_API_KEY || !CASE_PROFILES_TABLE) {
-  throw new Error("Missing required env vars.");
+  throw new Error("Missing required env vars (AIRTABLE_TOKEN, AIRTABLE_BASE_ID, OPENAI_API_KEY, CASE_PROFILES_TABLE).");
 }
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const airtable = new Airtable({ apiKey: AIRTABLE_TOKEN }).base(AIRTABLE_BASE_ID);
 
+function getHeaderValue(req: VercelRequest, name: string): string | undefined {
+  const v = req.headers[name.toLowerCase()];
+  if (Array.isArray(v)) return v[0];
+  if (typeof v === "string") return v;
+  return undefined;
+}
+
 function requireSecret(req: VercelRequest) {
-  const secret = req.headers["x-run-secret"];
-  if (!RUN_SECRET || secret !== RUN_SECRET) {
-    const err: any = new Error("Unauthorized");
+  const provided = getHeaderValue(req, "x-run-secret");
+  if (!RUN_SECRET || provided !== RUN_SECRET) {
+    const err: any = new Error("AUTH_FAILED_RUN_SECRET");
     err.status = 401;
     throw err;
   }
@@ -46,14 +53,17 @@ const CASE_FIELDS = [
   "Social History",
   "Family History",
   "ICE",
-  "Reaction"
+  "Reaction",
 ] as const;
 
 function normalizeFieldValue(v: any): string {
   if (v == null) return "";
   if (typeof v === "string") return v;
-  // Airtable attachments/arrays/objects
-  try { return JSON.stringify(v); } catch { return String(v); }
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
 }
 
 function buildCaseText(fields: Record<string, any>): string {
@@ -67,16 +77,22 @@ function buildCaseText(fields: Record<string, any>): string {
 }
 
 async function sleep(ms: number) {
-  await new Promise(r => setTimeout(r, ms));
+  await new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryableStatus(status?: number) {
+  return status === 429 || (status != null && status >= 500);
 }
 
 async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
   let lastErr: any;
   for (let i = 0; i < tries; i++) {
-    try { return await fn(); }
-    catch (e: any) {
+    try {
+      return await fn();
+    } catch (e: any) {
       lastErr = e;
-      // simple backoff for 429/5xx
+      const status = e?.status || e?.statusCode;
+      if (!isRetryableStatus(status) || i === tries - 1) break;
       await sleep(800 * (i + 1));
     }
   }
@@ -106,13 +122,11 @@ ${caseText}
   const resp = await withRetry(() =>
     openai.responses.create({
       model: "gpt-4.1-mini",
-      input: prompt
+      input: prompt,
     })
   );
 
-  const out = (resp.output_text || "").trim().replace(/\s+/g, " ");
-  // Enforce “2 sentences” lightly (don’t overthink; just keep it short)
-  return out;
+  return (resp.output_text || "").trim().replace(/\s+/g, " ");
 }
 
 function buildImagePrompt(photoDesc: string): string {
@@ -131,17 +145,18 @@ ${photoDesc}
 }
 
 async function generateHeadshotPngBase64(prompt: string): Promise<string> {
-  // GPT image models return base64 by default :contentReference[oaicite:1]{index=1}
   const img = await withRetry(() =>
     openai.images.generate({
       model: "gpt-image-1",
       prompt,
-      size: "1024x1024"
+      size: "1024x1024",
     })
   );
 
   const first: any = img.data?.[0];
-  if (!first?.b64_json) throw new Error("No b64_json returned from images API.");
+  if (!first?.b64_json) {
+    throw new Error("OPENAI_IMAGE_NO_B64_JSON");
+  }
   return first.b64_json as string;
 }
 
@@ -153,7 +168,7 @@ async function uploadToBlob(caseId: number, b64: string): Promise<string> {
     put(path, bytes, {
       access: "public",
       contentType: "image/png",
-      addRandomSuffix: false
+      addRandomSuffix: false,
     })
   );
 
@@ -176,17 +191,44 @@ async function upsertCaseProfile(caseId: number, updateFields: Record<string, an
 
 async function getCaseRecord(caseId: number) {
   const tableName = `Case ${caseId}`;
-  const records = await airtable(tableName).select({ maxRecords: 1 }).firstPage();
-  return records[0] || null;
+  try {
+    const records = await airtable(tableName).select({ maxRecords: 1 }).firstPage();
+    return { record: records[0] || null, tableName };
+  } catch (err: any) {
+    const e: any = new Error(`AIRTABLE_READ_FAILED table="${tableName}" msg="${err?.message || String(err)}"`);
+    e.status = err?.statusCode || err?.status || 500;
+    e.details = err;
+    throw e;
+  }
+}
+
+function extractUpstreamDetails(e: any) {
+  // Airtable SDK errors are inconsistent; this tries a few common shapes.
+  const status = e?.status || e?.statusCode || e?.response?.status;
+  const message = e?.message || String(e);
+  const airtableError = e?.error;
+  const raw = e?.response?.body || e?.response?.data || e?.details || null;
+
+  let rawPreview: string | null = null;
+  try {
+    rawPreview = typeof raw === "string" ? raw.slice(0, 800) : JSON.stringify(raw).slice(0, 800);
+  } catch {
+    rawPreview = null;
+  }
+
+  return { status, message, airtableError, rawPreview };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const requestId = getHeaderValue(req, "x-vercel-id") || undefined;
+
   try {
     requireSecret(req);
 
     const startFrom = Number(req.query.startFrom ?? 1);
     const limit = Number(req.query.limit ?? 10);
     const maxCase = Number(MAX_CASE_ID ?? 355);
+    const dryRun = String(req.query.dryRun ?? "0") === "1"; // if 1: no OpenAI, no blob upload
 
     const processed: any[] = [];
 
@@ -194,24 +236,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (processed.length >= limit) break;
 
       try {
-        // Optional: skip if already done
-        // (we check CaseProfiles for Status=done)
-        // For speed, you can remove this and rely on startFrom batching.
         await upsertCaseProfile(caseId, { Status: "processing", LastError: "" });
 
-        const rec = await getCaseRecord(caseId);
-        if (!rec) {
-          await upsertCaseProfile(caseId, { Status: "error", LastError: "No record found in Case table." });
+        const { record, tableName } = await getCaseRecord(caseId);
+        if (!record) {
+          await upsertCaseProfile(caseId, {
+            Status: "error",
+            LastError: `NO_RECORD_IN_TABLE ${tableName}`,
+          });
           processed.push({ caseId, status: "no-record" });
           continue;
         }
 
-        const caseText = buildCaseText(rec.fields as any);
+        const caseText = buildCaseText(record.fields as any);
+
+        if (dryRun) {
+          await upsertCaseProfile(caseId, {
+            PhotoDescription: "dryRun=1 (skipped OpenAI + image generation)",
+            Status: "dryrun-ok",
+          });
+          processed.push({ caseId, status: "dryrun-ok" });
+          continue;
+        }
+
         const photoDesc = await makePhotoDescription(caseText);
 
         await upsertCaseProfile(caseId, {
           PhotoDescription: photoDesc,
-          Status: "described"
+          Status: "described",
         });
 
         const imagePrompt = buildImagePrompt(photoDesc);
@@ -220,30 +272,44 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         await upsertCaseProfile(caseId, {
           ImageUrl: url,
-          Status: "done"
+          Status: "done",
         });
 
-        processed.push({ caseId, status: "done" });
+        processed.push({ caseId, status: "done", url });
 
-        // gentle throttle
         await sleep(250);
       } catch (err: any) {
+        const details = extractUpstreamDetails(err);
+
         await upsertCaseProfile(caseId, {
           Status: "error",
-          LastError: err?.message || String(err)
+          LastError: details.message,
         });
-        processed.push({ caseId, status: "error" });
+
+        processed.push({ caseId, status: "error", details });
       }
     }
 
     res.status(200).json({
       ok: true,
+      requestId,
       startFrom,
       limit,
+      maxCase,
+      dryRun,
       processedCount: processed.length,
-      processed
+      processed,
     });
   } catch (e: any) {
-    res.status(e?.status || 500).json({ ok: false, error: e?.message || "Unknown error" });
+    const details = extractUpstreamDetails(e);
+    const status = e?.status || 500;
+
+    res.status(status).json({
+      ok: false,
+      requestId,
+      error: details.message,
+      status,
+      upstream: details,
+    });
   }
 }
