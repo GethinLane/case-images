@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import Airtable from "airtable";
 import OpenAI from "openai";
-import { put } from "@vercel/blob";
+import { put, head } from "@vercel/blob";
 
 const {
   AIRTABLE_TOKEN,
@@ -9,17 +9,18 @@ const {
   OPENAI_API_KEY,
   RUN_SECRET,
   MAX_CASE_ID,
-  CASE_PROFILES_TABLE,
 } = process.env;
 
-if (!AIRTABLE_TOKEN || !AIRTABLE_BASE_ID || !OPENAI_API_KEY || !CASE_PROFILES_TABLE) {
-  throw new Error("Missing required env vars (AIRTABLE_TOKEN, AIRTABLE_BASE_ID, OPENAI_API_KEY, CASE_PROFILES_TABLE).");
+if (!AIRTABLE_TOKEN || !AIRTABLE_BASE_ID || !OPENAI_API_KEY || !RUN_SECRET) {
+  throw new Error(
+    "Missing env vars: AIRTABLE_TOKEN, AIRTABLE_BASE_ID, OPENAI_API_KEY, RUN_SECRET"
+  );
 }
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const airtable = new Airtable({ apiKey: AIRTABLE_TOKEN }).base(AIRTABLE_BASE_ID);
 
-function getHeaderValue(req: VercelRequest, name: string): string | undefined {
+function getHeader(req: VercelRequest, name: string): string | undefined {
   const v = req.headers[name.toLowerCase()];
   if (Array.isArray(v)) return v[0];
   if (typeof v === "string") return v;
@@ -27,12 +28,35 @@ function getHeaderValue(req: VercelRequest, name: string): string | undefined {
 }
 
 function requireSecret(req: VercelRequest) {
-  const provided = getHeaderValue(req, "x-run-secret");
-  if (!RUN_SECRET || provided !== RUN_SECRET) {
+  const provided = getHeader(req, "x-run-secret");
+  if (!provided || provided !== RUN_SECRET) {
     const err: any = new Error("AUTH_FAILED_RUN_SECRET");
     err.status = 401;
     throw err;
   }
+}
+
+async function sleep(ms: number) {
+  await new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryableStatus(status?: number) {
+  return status === 429 || (status != null && status >= 500);
+}
+
+async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
+  let lastErr: any;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      lastErr = e;
+      const status = e?.status || e?.statusCode;
+      if (!isRetryableStatus(status) || i === tries - 1) break;
+      await sleep(800 * (i + 1));
+    }
+  }
+  throw lastErr;
 }
 
 const CASE_FIELDS = [
@@ -76,27 +100,18 @@ function buildCaseText(fields: Record<string, any>): string {
   return parts.join("\n");
 }
 
-async function sleep(ms: number) {
-  await new Promise((r) => setTimeout(r, ms));
-}
-
-function isRetryableStatus(status?: number) {
-  return status === 429 || (status != null && status >= 500);
-}
-
-async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
-  let lastErr: any;
-  for (let i = 0; i < tries; i++) {
-    try {
-      return await fn();
-    } catch (e: any) {
-      lastErr = e;
-      const status = e?.status || e?.statusCode;
-      if (!isRetryableStatus(status) || i === tries - 1) break;
-      await sleep(800 * (i + 1));
-    }
+async function getCaseRecord(caseId: number) {
+  const tableName = `Case ${caseId}`;
+  try {
+    const records = await airtable(tableName).select({ maxRecords: 1 }).firstPage();
+    return { tableName, record: records[0] || null };
+  } catch (err: any) {
+    const e: any = new Error(
+      `AIRTABLE_READ_FAILED table="${tableName}" msg="${err?.message || String(err)}"`
+    );
+    e.status = err?.statusCode || err?.status || 500;
+    throw e;
   }
-  throw lastErr;
 }
 
 async function makePhotoDescription(caseText: string): Promise<string> {
@@ -154,81 +169,79 @@ async function generateHeadshotPngBase64(prompt: string): Promise<string> {
   );
 
   const first: any = img.data?.[0];
-  if (!first?.b64_json) {
-    throw new Error("OPENAI_IMAGE_NO_B64_JSON");
-  }
+  if (!first?.b64_json) throw new Error("OPENAI_IMAGE_NO_B64_JSON");
   return first.b64_json as string;
 }
 
-async function uploadToBlob(caseId: number, b64: string): Promise<string> {
+function pad3(n: number) {
+  return String(n).padStart(3, "0");
+}
+
+async function blobExists(pathname: string): Promise<boolean> {
+  try {
+    await head(pathname);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function uploadPng(caseId: number, b64: string, overwrite: boolean): Promise<string> {
+  const pathname = `case-avatars/${pad3(caseId)}.png`;
+  if (!overwrite) {
+    const exists = await blobExists(pathname);
+    if (exists) return (await head(pathname)).url;
+  }
+
   const bytes = Buffer.from(b64, "base64");
-  const path = `case-avatars/${String(caseId).padStart(3, "0")}.png`;
-
-  const res = await withRetry(() =>
-    put(path, bytes, {
-      access: "public",
-      contentType: "image/png",
-      addRandomSuffix: false,
-    })
-  );
-
+  const res = await put(pathname, bytes, {
+    access: "public",
+    contentType: "image/png",
+    addRandomSuffix: false,
+  });
   return res.url;
 }
 
-async function upsertCaseProfile(caseId: number, updateFields: Record<string, any>) {
-  const table = airtable(CASE_PROFILES_TABLE!);
-
-  const existing = await table
-    .select({ filterByFormula: `{CaseId} = ${caseId}`, maxRecords: 1 })
-    .firstPage();
-
-  if (existing.length) {
-    await table.update(existing[0].id, updateFields);
-  } else {
-    await table.create({ CaseId: caseId, ...updateFields });
+async function uploadProfileJson(
+  caseId: number,
+  obj: any,
+  overwrite: boolean
+): Promise<string> {
+  const pathname = `case-profiles/${pad3(caseId)}.json`;
+  if (!overwrite) {
+    const exists = await blobExists(pathname);
+    if (exists) return (await head(pathname)).url;
   }
+
+  const bytes = Buffer.from(JSON.stringify(obj, null, 2), "utf-8");
+  const res = await put(pathname, bytes, {
+    access: "public",
+    contentType: "application/json",
+    addRandomSuffix: false,
+  });
+  return res.url;
 }
 
-async function getCaseRecord(caseId: number) {
-  const tableName = `Case ${caseId}`;
-  try {
-    const records = await airtable(tableName).select({ maxRecords: 1 }).firstPage();
-    return { record: records[0] || null, tableName };
-  } catch (err: any) {
-    const e: any = new Error(`AIRTABLE_READ_FAILED table="${tableName}" msg="${err?.message || String(err)}"`);
-    e.status = err?.statusCode || err?.status || 500;
-    e.details = err;
-    throw e;
-  }
-}
-
-function extractUpstreamDetails(e: any) {
-  // Airtable SDK errors are inconsistent; this tries a few common shapes.
-  const status = e?.status || e?.statusCode || e?.response?.status;
-  const message = e?.message || String(e);
-  const airtableError = e?.error;
-  const raw = e?.response?.body || e?.response?.data || e?.details || null;
-
-  let rawPreview: string | null = null;
-  try {
-    rawPreview = typeof raw === "string" ? raw.slice(0, 800) : JSON.stringify(raw).slice(0, 800);
-  } catch {
-    rawPreview = null;
-  }
-
-  return { status, message, airtableError, rawPreview };
+function extractErr(e: any) {
+  return {
+    status: e?.status || e?.statusCode || 500,
+    message: e?.message || String(e),
+  };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const requestId = getHeaderValue(req, "x-vercel-id") || undefined;
-
   try {
     requireSecret(req);
 
     const startFrom = Number(req.query.startFrom ?? 1);
     const limit = Number(req.query.limit ?? 10);
     const maxCase = Number(MAX_CASE_ID ?? 355);
-    const dryRun = String(req.query.dryRun ?? "0") === "1"; // if 1: no OpenAI, no blob upload
+
+    // dryRun=1 => does NOT call OpenAI or Blob puts; just checks Airtable reads.
+    const dryRun = String(req.query.dryRun ?? "0") === "1";
+
+    // overwrite=1 => re-generate and re-upload even if files exist
+    const overwrite = String(req.query.overwrite ?? "0") === "1";
 
     const processed: any[] = [];
 
@@ -236,80 +249,64 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (processed.length >= limit) break;
 
       try {
-        await upsertCaseProfile(caseId, { Status: "processing", LastError: "" });
-
-        const { record, tableName } = await getCaseRecord(caseId);
+        const { tableName, record } = await getCaseRecord(caseId);
         if (!record) {
-          await upsertCaseProfile(caseId, {
-            Status: "error",
-            LastError: `NO_RECORD_IN_TABLE ${tableName}`,
-          });
-          processed.push({ caseId, status: "no-record" });
+          processed.push({ caseId, status: "no-record", tableName });
           continue;
         }
 
         const caseText = buildCaseText(record.fields as any);
 
         if (dryRun) {
-          await upsertCaseProfile(caseId, {
-            PhotoDescription: "dryRun=1 (skipped OpenAI + image generation)",
-            Status: "dryrun-ok",
-          });
           processed.push({ caseId, status: "dryrun-ok" });
           continue;
         }
 
-        const photoDesc = await makePhotoDescription(caseText);
+        const photoDescription = await makePhotoDescription(caseText);
+        const imagePrompt = buildImagePrompt(photoDescription);
 
-        await upsertCaseProfile(caseId, {
-          PhotoDescription: photoDesc,
-          Status: "described",
-        });
-
-        const imagePrompt = buildImagePrompt(photoDesc);
         const b64 = await generateHeadshotPngBase64(imagePrompt);
-        const url = await uploadToBlob(caseId, b64);
+        const imageUrl = await uploadPng(caseId, b64, overwrite);
 
-        await upsertCaseProfile(caseId, {
-          ImageUrl: url,
-          Status: "done",
+        const profile = {
+          caseId,
+          createdAt: new Date().toISOString(),
+          photoDescription,
+          imagePrompt,
+          imageUrl,
+          source: {
+            tableName,
+            fieldsIncluded: CASE_FIELDS,
+          },
+        };
+
+        const profileUrl = await uploadProfileJson(caseId, profile, overwrite);
+
+        processed.push({
+          caseId,
+          status: "done",
+          imageUrl,
+          profileUrl,
         });
-
-        processed.push({ caseId, status: "done", url });
 
         await sleep(250);
-      } catch (err: any) {
-        const details = extractUpstreamDetails(err);
-
-        await upsertCaseProfile(caseId, {
-          Status: "error",
-          LastError: details.message,
-        });
-
-        processed.push({ caseId, status: "error", details });
+      } catch (e: any) {
+        processed.push({ caseId, status: "error", error: extractErr(e) });
       }
     }
 
     res.status(200).json({
       ok: true,
-      requestId,
       startFrom,
       limit,
       maxCase,
       dryRun,
+      overwrite,
       processedCount: processed.length,
       processed,
     });
   } catch (e: any) {
-    const details = extractUpstreamDetails(e);
     const status = e?.status || 500;
-
-    res.status(status).json({
-      ok: false,
-      requestId,
-      error: details.message,
-      status,
-      upstream: details,
-    });
+    res.status(status).json({ ok: false, error: e?.message || "Unknown error", status });
   }
 }
