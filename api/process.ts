@@ -136,7 +136,7 @@ ${caseText}
 
   const resp = await withRetry(() =>
     openai.responses.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-5-mini",
       input: prompt,
     })
   );
@@ -162,10 +162,12 @@ ${photoDesc}
 async function generateHeadshotPngBase64(prompt: string): Promise<string> {
   const img = await withRetry(() =>
     openai.images.generate({
-      model: "gpt-image-1",
+      model: "gpt-image-1.5",
       prompt,
       size: "1024x1024",
+      quality: "high"
     })
+
   );
 
   const first: any = img.data?.[0];
