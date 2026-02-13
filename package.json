@@ -1,11 +1,11 @@
 {
-  "name": "airtable-case-images",
+  "name": "case-images",
   "private": true,
   "type": "module",
   "dependencies": {
-    "@vercel/blob": "^0.25.1",
+    "@vercel/blob": "^2.0.0",
     "airtable": "^0.12.2",
-    "openai": "^4.0.0",
-    "archiver": "^6.0.2"
+    "archiver": "^6.0.2",
+    "openai": "^4.0.0"
   }
 }
