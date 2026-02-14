@@ -9,7 +9,7 @@ const {
   AIRTABLE_TOKEN,
   AIRTABLE_BASE_ID,
   OPENAI_API_KEY,
-  BLOB_READ_WRITE_TOKEN, // presence check (Vercel Blob)
+  BLOB_READ_WRITE_TOKEN,
   RUN_SECRET,
   MAX_CASE_ID,
   IMAGE_MODEL,
@@ -24,6 +24,7 @@ if (!AIRTABLE_TOKEN || !AIRTABLE_BASE_ID || !OPENAI_API_KEY || !BLOB_READ_WRITE_
 }
 
 const maxCaseDefault = 355;
+
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const airtable = new Airtable({ apiKey: AIRTABLE_TOKEN }).base(AIRTABLE_BASE_ID);
 
@@ -70,7 +71,6 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
   throw lastErr;
 }
 
-// Your fields (included first), plus we include any extra fields that exist too.
 const CASE_FIELDS = [
   "Name",
   "Age",
@@ -111,7 +111,7 @@ function buildRecordText(fields: Record<string, any>): string {
     parts.push(`${k}: ${normalizeFieldValue(v)}`);
   }
 
-  // Include any extra fields (helps if your base has more columns)
+  // Include any extra fields, in case the base has more columns than expected
   for (const [k, v] of Object.entries(fields)) {
     if ((CASE_FIELDS as readonly string[]).includes(k)) continue;
     if (v == null || v === "") continue;
@@ -122,8 +122,7 @@ function buildRecordText(fields: Record<string, any>): string {
 }
 
 /**
- * Pull ALL records from "Case N" (first page up to 100 records) and concatenate.
- * This ensures we feed OpenAI all the case content, not just the first row.
+ * Pull ALL records from "Case N" (up to 100) and concatenate into one text blob.
  */
 async function getCaseText(caseId: number): Promise<{ tableName: string; caseText: string }> {
   const tableName = `Case ${caseId}`;
@@ -198,17 +197,14 @@ async function uploadPng(caseId: number, b64: string, overwrite: boolean): Promi
   return res.url;
 }
 
-// Deterministic selection so colors don’t collapse to “navy” every time.
+// Deterministic clothing color selection so the model can’t collapse to the same color.
 function seedFromText(caseId: number, text: string) {
   const h = crypto.createHash("sha256").update(`${caseId}::${text}`, "utf8").digest();
   return h.readUInt32BE(0);
 }
-
 function pick<T>(arr: readonly T[], seed: number): T {
   return arr[seed % arr.length];
 }
-
-// Palette avoids yellow/red/dark backgrounds constraints; includes navy but not dominant.
 const CLOTHING_COLORS = [
   "white",
   "light grey",
@@ -221,15 +217,17 @@ const CLOTHING_COLORS = [
   "navy",
 ] as const;
 
-// JSON profile: model picks clothing TYPE; code picks clothing COLOR.
+type GenderPresentation = "female-presenting" | "male-presenting";
+
 type VisualProfile = {
+  gender_presentation: GenderPresentation;
   age: string;
   build: "slim" | "average" | "stocky";
   hair: string;
   eyes: string;
   facial_features: string;
-  clothing_type: string;  // inferred from job/social history/lifestyle
-  clothing_color: "auto" | string; // model returns "auto"; code replaces with a real color
+  clothing_type: string;
+  clothing_color: "auto" | string; // model must return "auto"; code assigns a real color
   notes: string;
 };
 
@@ -239,6 +237,7 @@ You are creating a visual profile for a SYNTHETIC patient headshot.
 
 Return ONLY valid JSON with EXACTLY these keys:
 {
+  "gender_presentation": "female-presenting|male-presenting",
   "age": "...",
   "build": "slim|average|stocky",
   "hair": "...",
@@ -250,8 +249,11 @@ Return ONLY valid JSON with EXACTLY these keys:
 }
 
 Rules:
-- Use explicit details from the text when present.
-- If missing, infer realistic defaults and include the word "inferred" inside the value.
+- gender_presentation:
+  - If the text explicitly indicates girl/woman/female or he/him/she/her, etc., use that.
+  - If not explicit, infer from pronouns or other strong context in the text.
+  - If still unclear, choose one and note that it was inferred in notes.
+- Use explicit details when present. If missing, infer realistic defaults and include the word "inferred" inside the value.
 - Clothing type must be inferred from occupation/social history/lifestyle where possible:
   - healthcare → "scrubs" or "clinical tunic"
   - office/finance/law/admin → "button-down shirt" or "blouse", optional "blazer"
@@ -260,10 +262,10 @@ Rules:
   - student → "hoodie" or "casual sweatshirt"
   - fitness/outdoors → "athleisure top"
   - if unclear → "plain crew-neck top"
-- Headshot constraint: clothing must be headshot-appropriate (no tools, no hi-vis, no full uniform props).
+- Headshot constraint: clothing must be headshot-appropriate (no tools, no hi-vis, no props).
 - For clothing_color ALWAYS output exactly "auto" (do not choose a color).
 - BMI: do NOT output a numeric BMI unless height AND weight are explicitly present and you compute it; otherwise ignore BMI and set build.
-- Do NOT infer country/ethnicity from the name. If explicitly mentioned, put it in "notes" only.
+- Do NOT infer country/ethnicity from the name. If explicitly mentioned, put it in notes only.
 - Do NOT include the person’s name.
 
 Deterministic key (do not output): CASE_ID=${caseId}
@@ -285,13 +287,13 @@ ${caseText}
   const firstBrace = raw.indexOf("{");
   const lastBrace = raw.lastIndexOf("}");
   if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    throw new Error(`PROFILE_JSON_PARSE_FAILED: ${raw.slice(0, 200)}`);
+    throw new Error(`PROFILE_JSON_PARSE_FAILED: ${raw.slice(0, 240)}`);
   }
   const jsonText = raw.slice(firstBrace, lastBrace + 1);
-
   const parsed = JSON.parse(jsonText);
 
   const requiredKeys = [
+    "gender_presentation",
     "age",
     "build",
     "hair",
@@ -305,12 +307,15 @@ ${caseText}
     if (!(k in parsed)) throw new Error(`PROFILE_JSON_MISSING_KEY:${k}`);
   }
 
+  if (!["female-presenting", "male-presenting"].includes(parsed.gender_presentation)) {
+    throw new Error(`PROFILE_JSON_BAD_GENDER:${String(parsed.gender_presentation)}`);
+  }
   if (!["slim", "average", "stocky"].includes(parsed.build)) {
     throw new Error(`PROFILE_JSON_BAD_BUILD:${String(parsed.build)}`);
   }
 
+  // enforce contract: model must not pick a color
   if (String(parsed.clothing_color).toLowerCase() !== "auto") {
-    // enforce contract: model must not pick a color
     parsed.clothing_color = "auto";
   }
 
@@ -324,12 +329,16 @@ Plain light background (blue/white/grey only), studio side lighting, DSLR 80mm f
 Single person centered, shoulders and head in frame.
 No text, no logos, no watermark.
 
+CRITICAL CONSTRAINT:
+- The subject MUST be ${profile.gender_presentation}. Do not generate the opposite.
+
 IMPORTANT:
 - Clothing type + color must match the profile below.
 - Headshot-appropriate attire only (no hi-vis, no props).
-- Avoid generic repeated “navy t-shirt” look unless the profile specifies it.
+- Avoid generic repeated defaults unless the profile specifies them.
 
 Subject profile:
+- Gender presentation: ${profile.gender_presentation}
 - Age: ${profile.age}
 - Build: ${profile.build}
 - Hair: ${profile.hair}
@@ -356,6 +365,54 @@ async function generateHeadshotPngBase64(prompt: string): Promise<string> {
   return first.b64_json as string;
 }
 
+/**
+ * Vision check: verify the generated image matches expected gender_presentation.
+ * Returns true if clearly matches, false if mismatch/ambiguous.
+ */
+async function verifyGenderPresentation(imageB64: string, expected: GenderPresentation): Promise<boolean> {
+  const checkPrompt = `
+Look at this headshot image and answer ONLY "yes" or "no".
+Question: Is the subject clearly ${expected}?
+If ambiguous, answer "no".
+`.trim();
+
+  const resp = await withRetry(() =>
+    openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: checkPrompt },
+            { type: "input_image", image_url: `data:image/png;base64,${imageB64}` },
+          ],
+        },
+      ],
+    } as any)
+  );
+
+  const out = (resp.output_text || "").trim().toLowerCase();
+  return out.startsWith("yes");
+}
+
+/**
+ * Generate + verify + retry (up to 3 attempts) to reduce “girl JSON but man image” failures.
+ */
+async function generateVerifiedHeadshot(prompt: string, expected: GenderPresentation): Promise<string> {
+  let lastB64 = "";
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const b64 = await generateHeadshotPngBase64(prompt);
+    lastB64 = b64;
+
+    // Give the API a tiny breather; also helps avoid rate spikes
+    await sleep(150);
+
+    const ok = await verifyGenderPresentation(b64, expected);
+    if (ok) return b64;
+  }
+  return lastB64;
+}
+
 function extractErr(e: any) {
   return {
     status: e?.status || e?.statusCode || 500,
@@ -377,7 +434,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // overwrite=1 => regenerate even if blob files exist
     const overwrite = String(req.query.overwrite ?? "0") === "1";
 
-    // debug=1 => return caseText preview + profile JSON for first case only (no image)
+    // debug=1 => return caseText preview + profile JSON for the first case only (no image)
     const debug = String(req.query.debug ?? "0") === "1";
 
     const processed: any[] = [];
@@ -400,7 +457,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         const profile = await makeProfile(caseText, caseId);
 
-        // deterministically assign a color from palette
+        // deterministically assign clothing color from palette (model cannot collapse to one color)
         const seed = seedFromText(caseId, caseText);
         profile.clothing_color = pick(CLOTHING_COLORS, seed);
 
@@ -415,7 +472,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
 
         const imagePrompt = buildImagePromptFromProfile(profile, caseId);
-        const b64 = await generateHeadshotPngBase64(imagePrompt);
+
+        // generate with verification
+        const b64 = await generateVerifiedHeadshot(imagePrompt, profile.gender_presentation);
 
         const imageUrl = await uploadPng(caseId, b64, overwrite);
 
@@ -433,6 +492,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         processed.push({ caseId, status: "done", imageUrl, profileUrl });
 
+        // throttle a bit (esp. helpful if you’re running 2-at-a-time loops)
         await sleep(250);
       } catch (e: any) {
         processed.push({ caseId, status: "error", error: extractErr(e) });
