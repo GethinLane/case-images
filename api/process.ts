@@ -74,11 +74,6 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
    Airtable input aggregation
 ----------------------------- */
 
-// Add explicit fields for cultural relevance (recommended):
-// - "Country of origin"
-// - "Ethnic/cultural background"
-// - "Skin tone" (optional)
-// - "Hair texture" (optional)
 const CASE_FIELDS = [
   "Name",
   "Age",
@@ -98,12 +93,6 @@ const CASE_FIELDS = [
   "Family History",
   "ICE",
   "Reaction",
-
-  // Cultural/ethnicity inputs (explicit only; no guessing from names)
-  "Country of origin",
-  "Ethnic/cultural background",
-  "Skin tone",
-  "Hair texture",
 ] as const;
 
 function normalizeFieldValue(v: any): string {
@@ -136,7 +125,7 @@ function buildRecordText(fields: Record<string, any>): string {
 }
 
 /**
- * Pull all records from "Case N" and concatenate (ensures we see occupation, hobbies, etc.)
+ * Pull all records from "Case N" and concatenate
  */
 async function getCaseText(caseId: number): Promise<{ tableName: string; caseText: string }> {
   const tableName = `Case ${caseId}`;
@@ -275,7 +264,6 @@ function knitHint(clothingType: string) {
 
 type GenderPresentation = "female-presenting" | "male-presenting";
 type Socioeconomic = "affluent" | "average" | "struggling" | "homeless" | "unknown";
-
 type GlamLevel = "low" | "medium" | "high";
 type Retouching = "none" | "light";
 
@@ -289,23 +277,20 @@ type VisualProfile = {
   hair: string;
   eyes: string;
   facial_features: string;
+  appearance_findings: string;
 
-  // Only visible headshot findings explicitly stated (e.g. "left facial droop", "facial rash", "acne")
-  appearance_findings: string; // "none" or semicolon-separated list
-
-  // Cultural/ethnic representation: explicit-only
+  // Explicit-only cultural fields (from text only; do not guess)
   cultural_origin: string; // "unspecified" unless explicitly stated
   ethnic_background: string; // "unspecified" unless explicitly stated
   skin_tone: SkinTone; // "unspecified" unless explicitly stated
   hair_texture: HairTexture; // "unspecified" unless explicitly stated
 
   socioeconomic: Socioeconomic;
-
-  glam_level: GlamLevel; // controls “ordinary vs polished”
-  retouching: Retouching; // none/light only
+  glam_level: GlamLevel;
+  retouching: Retouching;
 
   clothing_type: string;
-  clothing_color: "auto" | string; // model returns auto; code chooses actual color
+  clothing_color: "auto" | string;
   accessories: string;
   grooming: string;
   makeup: string;
@@ -313,10 +298,10 @@ type VisualProfile = {
   style_context: string;
   notes: string;
 
-  background: "auto" | string; // model returns auto; code chooses actual background
+  background: "auto" | string;
 };
 
-// Normalizers so LLM can't break enums
+// Normalizers
 function normalizeBuild(raw: any): "slim" | "average" | "stocky" | null {
   const s = String(raw || "").toLowerCase();
   if (s.includes("slim")) return "slim";
@@ -349,7 +334,6 @@ function normalizeRetouching(raw: any): Retouching {
   if (s.includes("light")) return "light";
   return "none";
 }
-
 function normalizeSkinTone(raw: any): SkinTone {
   const s = String(raw || "").toLowerCase();
   if (s.includes("very_dark")) return "very_dark";
@@ -359,7 +343,6 @@ function normalizeSkinTone(raw: any): SkinTone {
   if (s.includes("light")) return "light";
   return "unspecified";
 }
-
 function normalizeHairTexture(raw: any): HairTexture {
   const s = String(raw || "").toLowerCase();
   if (s.includes("coily")) return "coily";
@@ -368,7 +351,6 @@ function normalizeHairTexture(raw: any): HairTexture {
   if (s.includes("straight")) return "straight";
   return "unspecified";
 }
-
 function normalizeExplicitString(raw: any): string {
   const s = String(raw ?? "").trim();
   return s.length ? s : "unspecified";
@@ -431,64 +413,34 @@ Return ONLY valid JSON with EXACTLY these keys:
 Rules:
 - Use explicit details from the text when present.
 - If missing, infer realistic defaults.
-- IMPORTANT: For enum fields (gender_presentation, build, socioeconomic, glam_level, retouching, skin_tone, hair_texture) output ONLY allowed values (no extra words).
+- For enum fields output ONLY allowed values.
 - clothing_color MUST be exactly "auto".
 - background MUST be exactly "auto".
 - Do NOT include the person’s name.
 - Do NOT infer country/ethnicity from the name.
 
 Cultural/ethnic representation (CRITICAL):
-- ONLY set cultural_origin / ethnic_background / skin_tone / hair_texture if explicitly stated in TEXT (including explicit Airtable fields like "Country of origin", "Ethnic/cultural background", "Skin tone", "Hair texture").
+- ONLY set cultural_origin / ethnic_background / skin_tone / hair_texture if explicitly stated in TEXT.
 - If NOT explicitly stated, set:
   - cultural_origin = "unspecified"
   - ethnic_background = "unspecified"
   - skin_tone = "unspecified"
   - hair_texture = "unspecified"
-- Do NOT guess ethnicity/nationality.
-- Avoid stereotypes/caricatures; keep styling contemporary and natural.
+- Do NOT guess origin/ethnicity.
 - Do NOT add traditional clothing unless explicitly stated.
 
 Appearance findings (CRITICAL):
 - Only include features visible in a headshot AND explicitly stated in the text.
-- Examples: facial droop (side specified), facial asymmetry, ptosis, facial swelling, rash, acne, bruising, scars, jaundice, cyanosis.
 - If none explicitly stated, output "none".
 - Do NOT infer visible signs from diagnoses alone.
 
 Clothing inference (headshot appropriate; subtle cues, not costume):
 - Prefer clothing that fits occupation AND hobbies/lifestyle AND socioeconomic context.
-- Examples:
-  - knitting/cross-stitch hobby → "knitted jumper" or "cozy cardigan"
-  - cashier/checkout worker → "store-uniform polo" or "work shirt" (NO logos/text)
-  - police officer → "uniform-style shirt" (NO badges/insignia/text)
-  - healthcare → "scrubs" or "clinical tunic"
-  - office/law/finance → "button-down shirt/blouse", optional blazer
-  - affluent → well-fitted smart clothing
-  - homeless → layered worn jacket/hoodie (subtle; headshot appropriate)
 - Avoid defaulting to a plain t-shirt if occupation/hobbies suggest a better choice.
+- No logos/text.
 
-Accessories:
-- affluent: include 1 subtle accessory (watch OR simple necklace OR small earrings).
-- average: optional subtle accessory, otherwise "none".
-- struggling/homeless: usually "none" unless text suggests otherwise.
-
-Grooming:
-- affluent/average: generally "neat".
-- struggling: "casual, slightly tired".
-- homeless: "tired, slightly unkempt" (subtle).
-
-Makeup:
-- female-presenting adults: default "subtle everyday makeup" unless strongly contraindicated by text.
-- male-presenting: usually "none".
-- children/teens: "none" or "minimal".
-- affluent: makeup can be slightly more polished; struggling/homeless: minimal or none.
-
-Glamour / realism control:
-- affluent AND young adult: glam_level often high.
-- affluent adult: medium or high.
-- average: medium.
-- struggling/homeless: low.
-- Do NOT describe as "model" or "perfect". Even high glam must look like a real person.
-- retouching: low glam = none; medium = none/light; high = light (never heavy).
+Accessories/Grooming/Makeup:
+- Keep appropriate to socioeconomic + age; natural realism.
 
 Deterministic key (do not output): CASE_ID=${caseId}
 
@@ -554,7 +506,7 @@ ${caseText}
   parsed.glam_level = normalizeGlam(parsed.glam_level);
   parsed.retouching = normalizeRetouching(parsed.retouching);
 
-  // Enforce contracts for deterministic choices
+  // enforce contracts for deterministic choices
   parsed.clothing_color = "auto";
   parsed.background = "auto";
 
@@ -564,7 +516,7 @@ ${caseText}
   }
   if (String(parsed.appearance_findings).trim() === "") parsed.appearance_findings = "none";
 
-  // cultural/ethnic explicit-only fields
+  // cultural explicit-only fields
   parsed.cultural_origin = normalizeExplicitString(parsed.cultural_origin);
   parsed.ethnic_background = normalizeExplicitString(parsed.ethnic_background);
   parsed.skin_tone = normalizeSkinTone(parsed.skin_tone);
@@ -611,7 +563,7 @@ CULTURAL APPROPRIATENESS (IMPORTANT):
 - ${phenotypeLine}
 - Do NOT caricature or exaggerate features.
 - Keep styling contemporary and natural.
-- Do NOT add traditional clothing unless explicitly stated in the profile/text.
+- Do NOT add traditional clothing unless explicitly stated.
 
 IMPORTANT:
 - Clothing and accessories must match the profile below.
@@ -650,8 +602,78 @@ Variation tag (do not render): V-${caseId}
 }
 
 /* -----------------------------
-   Image generation + verification
-   (gender + clothing adherence only)
+   Scan-only mode (NO images)
+   Find cases with explicit non-UK / mixed origin mentioned in text
+----------------------------- */
+
+type OriginScanResult = {
+  origin_status: "explicit-non-uk" | "explicit-uk" | "explicit-mixed" | "not-stated";
+  origins_mentioned: string[];
+  evidence: string;
+  confidence: "high" | "medium" | "low";
+};
+
+async function extractOriginFlag(caseText: string, caseId: number): Promise<OriginScanResult> {
+  const prompt = `
+You are scanning a synthetic patient case for cultural/origin info.
+
+Return ONLY valid JSON with EXACTLY these keys:
+{
+  "origin_status": "explicit-non-uk|explicit-uk|explicit-mixed|not-stated",
+  "origins_mentioned": ["..."],
+  "evidence": "...",
+  "confidence": "high|medium|low"
+}
+
+Rules (CRITICAL):
+- ONLY use information explicitly stated in the TEXT. Do NOT guess.
+- Do NOT infer nationality/ethnicity from the patient's name.
+- Do NOT infer from diagnosis alone (e.g. FGM does NOT automatically mean Nigeria).
+- If the text explicitly mentions any country/region/cultural origin, list it in origins_mentioned.
+- origin_status meanings:
+  - explicit-non-uk: text explicitly states origin is non-UK (e.g. "from Nigeria", "born in Pakistan", etc.)
+  - explicit-uk: text explicitly states UK origin only and no other origins
+  - explicit-mixed: text explicitly includes UK + at least one other origin (or multiple non-UK origins)
+  - not-stated: no explicit origin/cultural origin mentioned
+- evidence should be a short pointer (max 180 chars) quoting or clearly referencing the statement.
+- confidence: high when clear statement; medium if somewhat indirect but still explicit; low if weak/ambiguous but still explicit.
+
+Deterministic key (do not output): CASE_ID=${caseId}
+
+TEXT:
+${caseText}
+  `.trim();
+
+  const resp = await withRetry(() =>
+    openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: prompt,
+    })
+  );
+
+  const raw = (resp.output_text || "").trim();
+  const firstBrace = raw.indexOf("{");
+  const lastBrace = raw.lastIndexOf("}");
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    throw new Error(`ORIGIN_SCAN_JSON_PARSE_FAILED: ${raw.slice(0, 240)}`);
+  }
+
+  const parsed: any = JSON.parse(raw.slice(firstBrace, lastBrace + 1));
+
+  const allowedStatus = new Set(["explicit-non-uk", "explicit-uk", "explicit-mixed", "not-stated"]);
+  const allowedConf = new Set(["high", "medium", "low"]);
+
+  if (!allowedStatus.has(parsed.origin_status)) parsed.origin_status = "not-stated";
+  if (!Array.isArray(parsed.origins_mentioned)) parsed.origins_mentioned = [];
+  parsed.origins_mentioned = parsed.origins_mentioned.map((x: any) => String(x).trim()).filter(Boolean).slice(0, 10);
+  parsed.evidence = String(parsed.evidence || "").trim().slice(0, 180);
+  if (!allowedConf.has(parsed.confidence)) parsed.confidence = "low";
+
+  return parsed as OriginScanResult;
+}
+
+/* -----------------------------
+   Image generation + verification (gender + clothing only)
 ----------------------------- */
 
 async function generateHeadshotPngBase64(prompt: string): Promise<string> {
@@ -756,6 +778,73 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const dryRun = String(req.query.dryRun ?? "0") === "1";
     const overwrite = String(req.query.overwrite ?? "0") === "1";
     const debug = String(req.query.debug ?? "0") === "1";
+
+    // NEW: scan mode (no images). Finds explicit non-UK/mixed origin mentioned in case text.
+    const scanOrigin = String(req.query.scanOrigin ?? "0") === "1";
+    const endAt = Number(req.query.endAt ?? maxCase);
+
+    if (scanOrigin) {
+      const flagged: any[] = [];
+      const ukOnly: any[] = [];
+      const notStated: any[] = [];
+      const errors: any[] = [];
+
+      for (let caseId = startFrom; caseId <= endAt; caseId++) {
+        try {
+          const { tableName, caseText } = await getCaseText(caseId);
+
+          if (!caseText.trim()) {
+            notStated.push({
+              caseId,
+              tableName,
+              origin_status: "not-stated",
+              origins_mentioned: [],
+              evidence: "",
+              confidence: "low",
+            });
+            continue;
+          }
+
+          const r = await extractOriginFlag(caseText, caseId);
+
+          const row = {
+            caseId,
+            tableName,
+            origin_status: r.origin_status,
+            origins_mentioned: r.origins_mentioned,
+            evidence: r.evidence,
+            confidence: r.confidence,
+          };
+
+          if (r.origin_status === "explicit-non-uk" || r.origin_status === "explicit-mixed") {
+            flagged.push(row);
+          } else if (r.origin_status === "explicit-uk") {
+            ukOnly.push(row);
+          } else {
+            notStated.push(row);
+          }
+
+          await sleep(80);
+        } catch (e: any) {
+          errors.push({ caseId, error: extractErr(e) });
+        }
+      }
+
+      return res.status(200).json({
+        ok: true,
+        scanOrigin: true,
+        startFrom,
+        endAt,
+        counts: {
+          flagged: flagged.length,
+          ukOnly: ukOnly.length,
+          notStated: notStated.length,
+          errors: errors.length,
+        },
+        flagged,
+        errors,
+      });
+    }
 
     const processed: any[] = [];
 
