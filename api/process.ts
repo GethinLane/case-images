@@ -3,17 +3,18 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import Airtable from "airtable";
 import OpenAI from "openai";
 import { put, head } from "@vercel/blob";
+import crypto from "crypto";
 
 const {
   AIRTABLE_TOKEN,
   AIRTABLE_BASE_ID,
   OPENAI_API_KEY,
-  BLOB_READ_WRITE_TOKEN, // required by Vercel Blob (presence check)
+  BLOB_READ_WRITE_TOKEN, // presence check (Vercel Blob)
   RUN_SECRET,
   MAX_CASE_ID,
   IMAGE_MODEL,
   IMAGE_QUALITY,
-  IMAGE_SIZE
+  IMAGE_SIZE,
 } = process.env;
 
 if (!AIRTABLE_TOKEN || !AIRTABLE_BASE_ID || !OPENAI_API_KEY || !BLOB_READ_WRITE_TOKEN || !RUN_SECRET) {
@@ -69,7 +70,7 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
   throw lastErr;
 }
 
-// Fields you listed (we include these first, but also include any extras present)
+// Your fields (included first), plus we include any extra fields that exist too.
 const CASE_FIELDS = [
   "Name",
   "Age",
@@ -88,7 +89,7 @@ const CASE_FIELDS = [
   "Social History",
   "Family History",
   "ICE",
-  "Reaction"
+  "Reaction",
 ] as const;
 
 function normalizeFieldValue(v: any): string {
@@ -104,14 +105,13 @@ function normalizeFieldValue(v: any): string {
 function buildRecordText(fields: Record<string, any>): string {
   const parts: string[] = [];
 
-  // Preferred known fields first
   for (const k of CASE_FIELDS) {
     const v = fields[k];
     if (v == null || v === "") continue;
     parts.push(`${k}: ${normalizeFieldValue(v)}`);
   }
 
-  // Any extra fields too (in case your base has more)
+  // Include any extra fields (helps if your base has more columns)
   for (const [k, v] of Object.entries(fields)) {
     if ((CASE_FIELDS as readonly string[]).includes(k)) continue;
     if (v == null || v === "") continue;
@@ -122,8 +122,8 @@ function buildRecordText(fields: Record<string, any>): string {
 }
 
 /**
- * Pull ALL records from "Case N" and concatenate their fields into one text blob.
- * This avoids the "maxRecords:1" problem and ensures we feed OpenAI all content.
+ * Pull ALL records from "Case N" (first page up to 100 records) and concatenate.
+ * This ensures we feed OpenAI all the case content, not just the first row.
  */
 async function getCaseText(caseId: number): Promise<{ tableName: string; caseText: string }> {
   const tableName = `Case ${caseId}`;
@@ -174,7 +174,7 @@ async function uploadJson(caseId: number, obj: any, overwrite: boolean): Promise
   const res = await put(pathname, bytes, {
     access: "public",
     contentType: "application/json",
-    addRandomSuffix: false
+    addRandomSuffix: false,
   });
 
   return res.url;
@@ -192,25 +192,44 @@ async function uploadPng(caseId: number, b64: string, overwrite: boolean): Promi
   const res = await put(pathname, bytes, {
     access: "public",
     contentType: "image/png",
-    addRandomSuffix: false
+    addRandomSuffix: false,
   });
 
   return res.url;
 }
 
-/**
- * JSON profile extraction: forces the model to populate clothing from occupation/social history if possible,
- * while filling other visual defaults when missing.
- *
- * NOTE: We do NOT infer ethnicity/country from name. If explicitly mentioned in case text, it can appear in notes only.
- */
+// Deterministic selection so colors don’t collapse to “navy” every time.
+function seedFromText(caseId: number, text: string) {
+  const h = crypto.createHash("sha256").update(`${caseId}::${text}`, "utf8").digest();
+  return h.readUInt32BE(0);
+}
+
+function pick<T>(arr: readonly T[], seed: number): T {
+  return arr[seed % arr.length];
+}
+
+// Palette avoids yellow/red/dark backgrounds constraints; includes navy but not dominant.
+const CLOTHING_COLORS = [
+  "white",
+  "light grey",
+  "charcoal",
+  "black",
+  "light blue",
+  "medium blue",
+  "teal",
+  "dark green",
+  "navy",
+] as const;
+
+// JSON profile: model picks clothing TYPE; code picks clothing COLOR.
 type VisualProfile = {
   age: string;
   build: "slim" | "average" | "stocky";
   hair: string;
   eyes: string;
   facial_features: string;
-  clothing: string;
+  clothing_type: string;  // inferred from job/social history/lifestyle
+  clothing_color: "auto" | string; // model returns "auto"; code replaces with a real color
   notes: string;
 };
 
@@ -225,22 +244,25 @@ Return ONLY valid JSON with EXACTLY these keys:
   "hair": "...",
   "eyes": "...",
   "facial_features": "...",
-  "clothing": "...",
+  "clothing_type": "...",
+  "clothing_color": "auto",
   "notes": "short reasoning using occupation/social history, if any"
 }
 
 Rules:
 - Use explicit details from the text when present.
-- If missing, infer realistic defaults and state "inferred" inside the value (e.g., "inferred 30–40", "inferred medium-length brown hair").
-- Clothing: if the person’s occupation/social history implies attire, infer headshot-appropriate clothing:
-  - healthcare → scrubs or clinical attire
-  - office/finance/law/admin → business casual (button-down/blouse), optional blazer
-  - construction/trades → subtle workwear (sturdy jacket), no hi-vis
-  - retail/hospitality → smart casual (polo/shirt/blouse)
-  - student → casual hoodie/t-shirt
-  - fitness/outdoors → athleisure
-- Avoid default beige. Prefer navy/grey/white/blue/black/green tones.
-- BMI: do NOT output numeric BMI unless height AND weight are explicitly present and you compute it; otherwise ignore BMI and just set build.
+- If missing, infer realistic defaults and include the word "inferred" inside the value.
+- Clothing type must be inferred from occupation/social history/lifestyle where possible:
+  - healthcare → "scrubs" or "clinical tunic"
+  - office/finance/law/admin → "button-down shirt" or "blouse", optional "blazer"
+  - construction/trades → "workwear jacket" or "sturdy zip-up"
+  - retail/hospitality → "polo shirt" or "smart casual shirt/blouse"
+  - student → "hoodie" or "casual sweatshirt"
+  - fitness/outdoors → "athleisure top"
+  - if unclear → "plain crew-neck top"
+- Headshot constraint: clothing must be headshot-appropriate (no tools, no hi-vis, no full uniform props).
+- For clothing_color ALWAYS output exactly "auto" (do not choose a color).
+- BMI: do NOT output a numeric BMI unless height AND weight are explicitly present and you compute it; otherwise ignore BMI and set build.
 - Do NOT infer country/ethnicity from the name. If explicitly mentioned, put it in "notes" only.
 - Do NOT include the person’s name.
 
@@ -253,13 +275,13 @@ ${caseText}
   const resp = await withRetry(() =>
     openai.responses.create({
       model: "gpt-4.1-mini",
-      input: prompt
+      input: prompt,
     })
   );
 
   const raw = (resp.output_text || "").trim();
 
-  // Robust parse: sometimes models add stray text; try to extract JSON object.
+  // Robust JSON extraction
   const firstBrace = raw.indexOf("{");
   const lastBrace = raw.lastIndexOf("}");
   if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
@@ -269,13 +291,27 @@ ${caseText}
 
   const parsed = JSON.parse(jsonText);
 
-  // Minimal validation
-  const requiredKeys = ["age", "build", "hair", "eyes", "facial_features", "clothing", "notes"];
+  const requiredKeys = [
+    "age",
+    "build",
+    "hair",
+    "eyes",
+    "facial_features",
+    "clothing_type",
+    "clothing_color",
+    "notes",
+  ];
   for (const k of requiredKeys) {
     if (!(k in parsed)) throw new Error(`PROFILE_JSON_MISSING_KEY:${k}`);
   }
+
   if (!["slim", "average", "stocky"].includes(parsed.build)) {
     throw new Error(`PROFILE_JSON_BAD_BUILD:${String(parsed.build)}`);
+  }
+
+  if (String(parsed.clothing_color).toLowerCase() !== "auto") {
+    // enforce contract: model must not pick a color
+    parsed.clothing_color = "auto";
   }
 
   return parsed as VisualProfile;
@@ -288,8 +324,10 @@ Plain light background (blue/white/grey only), studio side lighting, DSLR 80mm f
 Single person centered, shoulders and head in frame.
 No text, no logos, no watermark.
 
-IMPORTANT: Clothing and styling must match the profile. Use headshot-appropriate attire.
-Avoid repeated generic beige defaults unless explicitly specified by the profile.
+IMPORTANT:
+- Clothing type + color must match the profile below.
+- Headshot-appropriate attire only (no hi-vis, no props).
+- Avoid generic repeated “navy t-shirt” look unless the profile specifies it.
 
 Subject profile:
 - Age: ${profile.age}
@@ -297,7 +335,7 @@ Subject profile:
 - Hair: ${profile.hair}
 - Eyes: ${profile.eyes}
 - Facial features: ${profile.facial_features}
-- Clothing: ${profile.clothing}
+- Clothing: ${profile.clothing_type} in ${profile.clothing_color}
 
 Variation tag (do not render): V-${caseId}
 `.trim().replace(/\s+/g, " ");
@@ -309,7 +347,7 @@ async function generateHeadshotPngBase64(prompt: string): Promise<string> {
       model: IMAGE_MODEL_USED,
       prompt,
       size: IMAGE_SIZE_USED,
-      quality: IMAGE_QUALITY_USED
+      quality: IMAGE_QUALITY_USED,
     } as any)
   );
 
@@ -321,7 +359,7 @@ async function generateHeadshotPngBase64(prompt: string): Promise<string> {
 function extractErr(e: any) {
   return {
     status: e?.status || e?.statusCode || 500,
-    message: e?.message || String(e)
+    message: e?.message || String(e),
   };
 }
 
@@ -339,7 +377,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // overwrite=1 => regenerate even if blob files exist
     const overwrite = String(req.query.overwrite ?? "0") === "1";
 
-    // debug=1 => return caseText preview + profile JSON for the first case only (no image)
+    // debug=1 => return caseText preview + profile JSON for first case only (no image)
     const debug = String(req.query.debug ?? "0") === "1";
 
     const processed: any[] = [];
@@ -362,13 +400,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         const profile = await makeProfile(caseText, caseId);
 
+        // deterministically assign a color from palette
+        const seed = seedFromText(caseId, caseText);
+        profile.clothing_color = pick(CLOTHING_COLORS, seed);
+
         if (debug) {
           return res.status(200).json({
             ok: true,
             caseId,
             tableName,
             caseTextPreview: caseText.slice(0, 2500),
-            profile
+            profile,
           });
         }
 
@@ -383,7 +425,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           profile,
           imagePrompt,
           imageUrl,
-          source: { tableName }
+          source: { tableName },
+          image: { model: IMAGE_MODEL_USED, quality: IMAGE_QUALITY_USED, size: IMAGE_SIZE_USED },
         };
 
         const profileUrl = await uploadJson(caseId, profileDoc, overwrite);
@@ -407,7 +450,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       quality: IMAGE_QUALITY_USED,
       size: IMAGE_SIZE_USED,
       processedCount: processed.length,
-      processed
+      processed,
     });
   } catch (e: any) {
     const status = e?.status || 500;
