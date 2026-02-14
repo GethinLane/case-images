@@ -27,7 +27,7 @@ const maxCaseDefault = 355;
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const airtable = new Airtable({ apiKey: AIRTABLE_TOKEN }).base(AIRTABLE_BASE_ID);
 
-const IMAGE_MODEL_USED = IMAGE_MODEL || "gpt-image-1";
+const IMAGE_MODEL_USED = IMAGE_MODEL || "gpt-image-1.5";
 const IMAGE_QUALITY_USED = (IMAGE_QUALITY || "medium") as any;
 const IMAGE_SIZE_USED = (IMAGE_SIZE || "1024x1024") as any;
 
@@ -74,6 +74,11 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
    Airtable input aggregation
 ----------------------------- */
 
+// Add explicit fields for cultural relevance (recommended):
+// - "Country of origin"
+// - "Ethnic/cultural background"
+// - "Skin tone" (optional)
+// - "Hair texture" (optional)
 const CASE_FIELDS = [
   "Name",
   "Age",
@@ -93,6 +98,12 @@ const CASE_FIELDS = [
   "Family History",
   "ICE",
   "Reaction",
+
+  // Cultural/ethnicity inputs (explicit only; no guessing from names)
+  "Country of origin",
+  "Ethnic/cultural background",
+  "Skin tone",
+  "Hair texture",
 ] as const;
 
 function normalizeFieldValue(v: any): string {
@@ -142,9 +153,7 @@ async function getCaseText(caseId: number): Promise<{ tableName: string; caseTex
 
     return { tableName, caseText: combined };
   } catch (err: any) {
-    const e: any = new Error(
-      `AIRTABLE_READ_FAILED table="${tableName}" msg="${err?.message || String(err)}"`
-    );
+    const e: any = new Error(`AIRTABLE_READ_FAILED table="${tableName}" msg="${err?.message || String(err)}"`);
     e.status = err?.statusCode || err?.status || 500;
     e.details = err;
     throw e;
@@ -270,6 +279,9 @@ type Socioeconomic = "affluent" | "average" | "struggling" | "homeless" | "unkno
 type GlamLevel = "low" | "medium" | "high";
 type Retouching = "none" | "light";
 
+type SkinTone = "very_light" | "light" | "medium" | "dark" | "very_dark" | "unspecified";
+type HairTexture = "straight" | "wavy" | "curly" | "coily" | "unspecified";
+
 type VisualProfile = {
   gender_presentation: GenderPresentation;
   age: string;
@@ -281,10 +293,16 @@ type VisualProfile = {
   // Only visible headshot findings explicitly stated (e.g. "left facial droop", "facial rash", "acne")
   appearance_findings: string; // "none" or semicolon-separated list
 
+  // Cultural/ethnic representation: explicit-only
+  cultural_origin: string; // "unspecified" unless explicitly stated
+  ethnic_background: string; // "unspecified" unless explicitly stated
+  skin_tone: SkinTone; // "unspecified" unless explicitly stated
+  hair_texture: HairTexture; // "unspecified" unless explicitly stated
+
   socioeconomic: Socioeconomic;
 
-  glam_level: GlamLevel;       // controls “ordinary vs polished”
-  retouching: Retouching;     // none/light only
+  glam_level: GlamLevel; // controls “ordinary vs polished”
+  retouching: Retouching; // none/light only
 
   clothing_type: string;
   clothing_color: "auto" | string; // model returns auto; code chooses actual color
@@ -332,6 +350,30 @@ function normalizeRetouching(raw: any): Retouching {
   return "none";
 }
 
+function normalizeSkinTone(raw: any): SkinTone {
+  const s = String(raw || "").toLowerCase();
+  if (s.includes("very_dark")) return "very_dark";
+  if (s.includes("dark")) return "dark";
+  if (s.includes("medium")) return "medium";
+  if (s.includes("very_light")) return "very_light";
+  if (s.includes("light")) return "light";
+  return "unspecified";
+}
+
+function normalizeHairTexture(raw: any): HairTexture {
+  const s = String(raw || "").toLowerCase();
+  if (s.includes("coily")) return "coily";
+  if (s.includes("curly")) return "curly";
+  if (s.includes("wavy")) return "wavy";
+  if (s.includes("straight")) return "straight";
+  return "unspecified";
+}
+
+function normalizeExplicitString(raw: any): string {
+  const s = String(raw ?? "").trim();
+  return s.length ? s : "unspecified";
+}
+
 function glamStyleBlock(glam: GlamLevel, retouching: Retouching) {
   if (glam === "high") {
     return `
@@ -367,6 +409,12 @@ Return ONLY valid JSON with EXACTLY these keys:
   "eyes": "...",
   "facial_features": "...",
   "appearance_findings": "...",
+
+  "cultural_origin": "...",
+  "ethnic_background": "...",
+  "skin_tone": "very_light|light|medium|dark|very_dark|unspecified",
+  "hair_texture": "straight|wavy|curly|coily|unspecified",
+
   "socioeconomic": "affluent|average|struggling|homeless|unknown",
   "glam_level": "low|medium|high",
   "retouching": "none|light",
@@ -383,11 +431,22 @@ Return ONLY valid JSON with EXACTLY these keys:
 Rules:
 - Use explicit details from the text when present.
 - If missing, infer realistic defaults.
-- IMPORTANT: For enum fields (gender_presentation, build, socioeconomic, glam_level, retouching) output ONLY allowed values (no extra words).
+- IMPORTANT: For enum fields (gender_presentation, build, socioeconomic, glam_level, retouching, skin_tone, hair_texture) output ONLY allowed values (no extra words).
 - clothing_color MUST be exactly "auto".
 - background MUST be exactly "auto".
 - Do NOT include the person’s name.
 - Do NOT infer country/ethnicity from the name.
+
+Cultural/ethnic representation (CRITICAL):
+- ONLY set cultural_origin / ethnic_background / skin_tone / hair_texture if explicitly stated in TEXT (including explicit Airtable fields like "Country of origin", "Ethnic/cultural background", "Skin tone", "Hair texture").
+- If NOT explicitly stated, set:
+  - cultural_origin = "unspecified"
+  - ethnic_background = "unspecified"
+  - skin_tone = "unspecified"
+  - hair_texture = "unspecified"
+- Do NOT guess ethnicity/nationality.
+- Avoid stereotypes/caricatures; keep styling contemporary and natural.
+- Do NOT add traditional clothing unless explicitly stated.
 
 Appearance findings (CRITICAL):
 - Only include features visible in a headshot AND explicitly stated in the text.
@@ -461,6 +520,12 @@ ${caseText}
     "eyes",
     "facial_features",
     "appearance_findings",
+
+    "cultural_origin",
+    "ethnic_background",
+    "skin_tone",
+    "hair_texture",
+
     "socioeconomic",
     "glam_level",
     "retouching",
@@ -489,14 +554,21 @@ ${caseText}
   parsed.glam_level = normalizeGlam(parsed.glam_level);
   parsed.retouching = normalizeRetouching(parsed.retouching);
 
-  // enforce contracts
+  // Enforce contracts for deterministic choices
   parsed.clothing_color = "auto";
   parsed.background = "auto";
 
+  // appearance findings contract
   if (!parsed.appearance_findings || typeof parsed.appearance_findings !== "string") {
     parsed.appearance_findings = "none";
   }
   if (String(parsed.appearance_findings).trim() === "") parsed.appearance_findings = "none";
+
+  // cultural/ethnic explicit-only fields
+  parsed.cultural_origin = normalizeExplicitString(parsed.cultural_origin);
+  parsed.ethnic_background = normalizeExplicitString(parsed.ethnic_background);
+  parsed.skin_tone = normalizeSkinTone(parsed.skin_tone);
+  parsed.hair_texture = normalizeHairTexture(parsed.hair_texture);
 
   return parsed as VisualProfile;
 }
@@ -505,6 +577,20 @@ function buildImagePromptFromProfile(profile: VisualProfile, caseId: number): st
   const background = String(profile.background);
   const knit = knitHint(profile.clothing_type);
   const glamBlock = glamStyleBlock(profile.glam_level, profile.retouching);
+
+  const cultureLine =
+    profile.cultural_origin !== "unspecified" || profile.ethnic_background !== "unspecified"
+      ? `Cultural context (explicit from case text): ${profile.cultural_origin}${
+          profile.ethnic_background !== "unspecified" ? `; ${profile.ethnic_background}` : ""
+        }.`
+      : `Cultural context: unspecified (do not guess).`;
+
+  const phenotypeParts: string[] = [];
+  if (profile.skin_tone !== "unspecified") phenotypeParts.push(`Skin tone: ${profile.skin_tone}`);
+  if (profile.hair_texture !== "unspecified") phenotypeParts.push(`Hair texture: ${profile.hair_texture}`);
+  const phenotypeLine = phenotypeParts.length
+    ? `Phenotype constraints (explicit only): ${phenotypeParts.join(", ")}.`
+    : `Phenotype constraints: unspecified (do not guess).`;
 
   return `
 Photorealistic studio headshot, facing camera, mildly happy expression.
@@ -519,6 +605,13 @@ CRITICAL CONSTRAINT:
 - The subject MUST be ${profile.gender_presentation}. Do not generate the opposite.
 
 ${glamBlock}
+
+CULTURAL APPROPRIATENESS (IMPORTANT):
+- ${cultureLine}
+- ${phenotypeLine}
+- Do NOT caricature or exaggerate features.
+- Keep styling contemporary and natural.
+- Do NOT add traditional clothing unless explicitly stated in the profile/text.
 
 IMPORTANT:
 - Clothing and accessories must match the profile below.
@@ -537,6 +630,12 @@ Subject profile:
 - Eyes: ${profile.eyes}
 - Facial features: ${profile.facial_features}
 - Visible facial findings: ${profile.appearance_findings}
+
+- Cultural origin: ${profile.cultural_origin}
+- Ethnic background: ${profile.ethnic_background}
+- Skin tone: ${profile.skin_tone}
+- Hair texture: ${profile.hair_texture}
+
 - Socioeconomic vibe: ${profile.socioeconomic}
 - Glam level: ${profile.glam_level}
 - Retouching: ${profile.retouching}
