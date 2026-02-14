@@ -27,7 +27,7 @@ const maxCaseDefault = 355;
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const airtable = new Airtable({ apiKey: AIRTABLE_TOKEN }).base(AIRTABLE_BASE_ID);
 
-const IMAGE_MODEL_USED = IMAGE_MODEL || "gpt-image-1.5";
+const IMAGE_MODEL_USED = IMAGE_MODEL || "gpt-image-1";
 const IMAGE_QUALITY_USED = (IMAGE_QUALITY || "medium") as any;
 const IMAGE_SIZE_USED = (IMAGE_SIZE || "1024x1024") as any;
 
@@ -70,7 +70,10 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
   throw lastErr;
 }
 
-// Airtable fields you listed; we include these first then any extras.
+/* -----------------------------
+   Airtable input aggregation
+----------------------------- */
+
 const CASE_FIELDS = [
   "Name",
   "Age",
@@ -111,6 +114,7 @@ function buildRecordText(fields: Record<string, any>): string {
     parts.push(`${k}: ${normalizeFieldValue(v)}`);
   }
 
+  // include any extra fields too (helps if your base has more columns)
   for (const [k, v] of Object.entries(fields)) {
     if ((CASE_FIELDS as readonly string[]).includes(k)) continue;
     if (v == null || v === "") continue;
@@ -121,7 +125,7 @@ function buildRecordText(fields: Record<string, any>): string {
 }
 
 /**
- * Pull ALL records from "Case N" (up to 100) and concatenate.
+ * Pull all records from "Case N" and concatenate (ensures we see occupation, hobbies, etc.)
  */
 async function getCaseText(caseId: number): Promise<{ tableName: string; caseText: string }> {
   const tableName = `Case ${caseId}`;
@@ -146,6 +150,10 @@ async function getCaseText(caseId: number): Promise<{ tableName: string; caseTex
     throw e;
   }
 }
+
+/* -----------------------------
+   Vercel Blob storage
+----------------------------- */
 
 function pad3(n: number) {
   return String(n).padStart(3, "0");
@@ -196,7 +204,10 @@ async function uploadPng(caseId: number, b64: string, overwrite: boolean): Promi
   return res.url;
 }
 
-// Deterministic selections
+/* -----------------------------
+   Deterministic variety controls
+----------------------------- */
+
 function seedFromText(caseId: number, text: string) {
   const h = crypto.createHash("sha256").update(`${caseId}::${text}`, "utf8").digest();
   return h.readUInt32BE(0);
@@ -205,23 +216,22 @@ function pick<T>(arr: readonly T[], seed: number): T {
   return arr[seed % arr.length];
 }
 
-// Background: ALWAYS very light cool-grey. Never medium/dark, never blue/white.
+// Background: ALWAYS very light grey variants only (never medium/dark; no blue tint)
 const BACKGROUNDS = [
-  "very light cool-grey (#f7f7f8) with a subtle gradient",
-  "very light cool-grey (#f4f5f7) with a soft vignette",
-  "off-white cool-grey (#fafafb) studio paper sweep",
-  "very pale grey (#f6f6f6) seamless background",
+  "very light neutral grey (#f7f7f7) seamless studio background with a subtle gradient",
+  "very light neutral grey (#f6f6f6) paper sweep background, evenly lit",
+  "very pale grey (#f8f8f8) soft vignette, still very light",
+  "off-white grey (#fafafa) seamless background, no color tint",
 ] as const;
 
-// Clothing colors: remove ALL grey options, add more color variety.
-// (No yellow/red per your constraints.)
+// Clothing colors: remove ALL grey, allow more colour, avoid yellow/red, avoid background match
 const CLOTHING_COLORS = [
   "navy",
+  "cobalt blue",
+  "royal blue",
   "deep teal",
   "forest green",
   "emerald green",
-  "cobalt blue",
-  "royal blue",
   "burgundy",
   "plum",
   "black",
@@ -232,8 +242,33 @@ const CLOTHING_COLORS = [
   "soft lavender",
 ] as const;
 
+function ensureNoBackgroundClothingClash(clothingColor: string, background: string) {
+  // Since backgrounds are light grey/off-white, avoid white/cream if it risks blending.
+  const c = clothingColor.toLowerCase();
+  const b = background.toLowerCase();
+  if ((c.includes("white") || c.includes("cream")) && (b.includes("off-white") || b.includes("#fafafa"))) {
+    return "navy";
+  }
+  return clothingColor;
+}
+
+function knitHint(clothingType: string) {
+  const s = clothingType.toLowerCase();
+  if (s.includes("knit") || s.includes("jumper") || s.includes("cardigan") || s.includes("sweater")) {
+    return "The jumper/cardigan must show clearly visible knitted texture (ribbed or cable-knit) around neckline and shoulders.";
+  }
+  return "";
+}
+
+/* -----------------------------
+   Profile + prompt building
+----------------------------- */
+
 type GenderPresentation = "female-presenting" | "male-presenting";
 type Socioeconomic = "affluent" | "average" | "struggling" | "homeless" | "unknown";
+
+type GlamLevel = "low" | "medium" | "high";
+type Retouching = "none" | "light";
 
 type VisualProfile = {
   gender_presentation: GenderPresentation;
@@ -243,37 +278,36 @@ type VisualProfile = {
   eyes: string;
   facial_features: string;
 
-  // Visible facial/skin findings (ONLY if explicitly stated)
-  appearance_findings: string; // "none" or "left facial droop; mild acne"
+  // Only visible headshot findings explicitly stated (e.g. "left facial droop", "facial rash", "acne")
+  appearance_findings: string; // "none" or semicolon-separated list
 
   socioeconomic: Socioeconomic;
+
+  glam_level: GlamLevel;       // controls “ordinary vs polished”
+  retouching: Retouching;     // none/light only
+
   clothing_type: string;
-  clothing_color: "auto" | string; // model must return "auto"; code sets actual
+  clothing_color: "auto" | string; // model returns auto; code chooses actual color
   accessories: string;
   grooming: string;
-
-  // Makeup control
-  makeup: string; // e.g. "subtle everyday makeup", "none", "minimal makeup"
+  makeup: string;
 
   style_context: string;
   notes: string;
 
-  // background chosen in code, not model
-  background: "auto" | string;
+  background: "auto" | string; // model returns auto; code chooses actual background
 };
 
-// Normalizers so the model can’t break enum fields
+// Normalizers so LLM can't break enums
 function normalizeBuild(raw: any): "slim" | "average" | "stocky" | null {
-  if (!raw) return null;
-  const s = String(raw).toLowerCase();
+  const s = String(raw || "").toLowerCase();
   if (s.includes("slim")) return "slim";
   if (s.includes("stocky")) return "stocky";
   if (s.includes("average")) return "average";
   return null;
 }
 function normalizeGender(raw: any): GenderPresentation | null {
-  if (!raw) return null;
-  const s = String(raw).toLowerCase();
+  const s = String(raw || "").toLowerCase();
   if (s.includes("female")) return "female-presenting";
   if (s.includes("male")) return "male-presenting";
   return null;
@@ -286,27 +320,43 @@ function normalizeSocio(raw: any): Socioeconomic {
   if (s.includes("average")) return "average";
   return "unknown";
 }
-
-function knitHint(clothingType: string) {
-  const s = clothingType.toLowerCase();
-  if (s.includes("knit") || s.includes("jumper") || s.includes("cardigan") || s.includes("sweater")) {
-    return "Ensure the clothing has clearly visible knitted texture (e.g., ribbed or cable-knit) around the neckline and shoulders.";
-  }
-  return "";
+function normalizeGlam(raw: any): GlamLevel {
+  const s = String(raw || "").toLowerCase();
+  if (s.includes("high")) return "high";
+  if (s.includes("low")) return "low";
+  return "medium";
+}
+function normalizeRetouching(raw: any): Retouching {
+  const s = String(raw || "").toLowerCase();
+  if (s.includes("light")) return "light";
+  return "none";
 }
 
-function ensureNoBackgroundClothingClash(clothingColor: string, backgroundDesc: string) {
-  // Our backgrounds are all very light grey/white; avoid white/cream if risk of blending.
-  const c = clothingColor.toLowerCase();
-  if ((c.includes("white") || c.includes("cream")) && backgroundDesc.toLowerCase().includes("off-white")) {
-    return "black";
+function glamStyleBlock(glam: GlamLevel, retouching: Retouching) {
+  if (glam === "high") {
+    return `
+Style: well-presented and stylish (higher social presentation), but still a real person.
+- No fashion/editorial vibe; no "model" look.
+- Retouching: ${retouching} (never heavy; never airbrushed).
+- Natural skin texture must remain visible (pores OK).`.trim();
   }
-  return clothingColor;
+  if (glam === "low") {
+    return `
+Style: ordinary everyday realism.
+- Practical, minimally styled appearance.
+- Retouching: none.
+- Natural skin texture, small imperfections allowed.`.trim();
+  }
+  return `
+Style: typical everyday “put together” realism.
+- Light/normal styling, not fashion/editorial.
+- Retouching: ${retouching} (light at most).
+- Natural skin texture visible.`.trim();
 }
 
 async function makeProfile(caseText: string, caseId: number): Promise<VisualProfile> {
   const prompt = `
-You are creating a visual profile for a SYNTHETIC patient headshot.
+You are creating a visual profile for a SYNTHETIC patient headshot for a medical training product.
 
 Return ONLY valid JSON with EXACTLY these keys:
 {
@@ -318,6 +368,8 @@ Return ONLY valid JSON with EXACTLY these keys:
   "facial_features": "...",
   "appearance_findings": "...",
   "socioeconomic": "affluent|average|struggling|homeless|unknown",
+  "glam_level": "low|medium|high",
+  "retouching": "none|light",
   "clothing_type": "...",
   "clothing_color": "auto",
   "accessories": "...",
@@ -331,33 +383,27 @@ Return ONLY valid JSON with EXACTLY these keys:
 Rules:
 - Use explicit details from the text when present.
 - If missing, infer realistic defaults.
-- IMPORTANT: For enum fields (gender_presentation, build, socioeconomic) output ONLY allowed values (no extra words).
+- IMPORTANT: For enum fields (gender_presentation, build, socioeconomic, glam_level, retouching) output ONLY allowed values (no extra words).
 - clothing_color MUST be exactly "auto".
 - background MUST be exactly "auto".
 - Do NOT include the person’s name.
 - Do NOT infer country/ethnicity from the name.
 
 Appearance findings (CRITICAL):
-- Only include facial/skin features visible in a headshot AND explicitly stated in the text.
+- Only include features visible in a headshot AND explicitly stated in the text.
 - Examples: facial droop (side specified), facial asymmetry, ptosis, facial swelling, rash, acne, bruising, scars, jaundice, cyanosis.
 - If none explicitly stated, output "none".
 - Do NOT infer visible signs from diagnoses alone.
 
-Socioeconomic inference:
-- affluent: executive roles, expensive hobbies, clear wealth cues.
-- struggling: financial stress, unemployment cues.
-- homeless: explicitly stated homelessness/rough sleeping.
-- otherwise average/unknown.
-
 Clothing inference (headshot appropriate; subtle cues, not costume):
-- Prefer clothing that fits occupation AND lifestyle AND socioeconomic context.
+- Prefer clothing that fits occupation AND hobbies/lifestyle AND socioeconomic context.
 - Examples:
   - knitting/cross-stitch hobby → "knitted jumper" or "cozy cardigan"
   - cashier/checkout worker → "store-uniform polo" or "work shirt" (NO logos/text)
   - police officer → "uniform-style shirt" (NO badges/insignia/text)
   - healthcare → "scrubs" or "clinical tunic"
   - office/law/finance → "button-down shirt/blouse", optional blazer
-  - affluent → allow well-fitted smart clothing
+  - affluent → well-fitted smart clothing
   - homeless → layered worn jacket/hoodie (subtle; headshot appropriate)
 - Avoid defaulting to a plain t-shirt if occupation/hobbies suggest a better choice.
 
@@ -367,15 +413,23 @@ Accessories:
 - struggling/homeless: usually "none" unless text suggests otherwise.
 
 Grooming:
-- affluent/average: "neat".
+- affluent/average: generally "neat".
 - struggling: "casual, slightly tired".
 - homeless: "tired, slightly unkempt" (subtle).
 
 Makeup:
-- For female-presenting adults: default to "subtle everyday makeup" unless the case strongly suggests otherwise.
-- For male-presenting: usually "none".
-- For children/teens: "none" or "minimal" (keep natural).
-- If affluent: makeup can be slightly more polished; if struggling/homeless: minimal or none.
+- female-presenting adults: default "subtle everyday makeup" unless strongly contraindicated by text.
+- male-presenting: usually "none".
+- children/teens: "none" or "minimal".
+- affluent: makeup can be slightly more polished; struggling/homeless: minimal or none.
+
+Glamour / realism control:
+- affluent AND young adult: glam_level often high.
+- affluent adult: medium or high.
+- average: medium.
+- struggling/homeless: low.
+- Do NOT describe as "model" or "perfect". Even high glam must look like a real person.
+- retouching: low glam = none; medium = none/light; high = light (never heavy).
 
 Deterministic key (do not output): CASE_ID=${caseId}
 
@@ -391,7 +445,6 @@ ${caseText}
   );
 
   const raw = (resp.output_text || "").trim();
-
   const firstBrace = raw.indexOf("{");
   const lastBrace = raw.lastIndexOf("}");
   if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
@@ -409,6 +462,8 @@ ${caseText}
     "facial_features",
     "appearance_findings",
     "socioeconomic",
+    "glam_level",
+    "retouching",
     "clothing_type",
     "clothing_color",
     "accessories",
@@ -431,34 +486,45 @@ ${caseText}
   parsed.build = nb;
 
   parsed.socioeconomic = normalizeSocio(parsed.socioeconomic);
+  parsed.glam_level = normalizeGlam(parsed.glam_level);
+  parsed.retouching = normalizeRetouching(parsed.retouching);
+
+  // enforce contracts
+  parsed.clothing_color = "auto";
+  parsed.background = "auto";
 
   if (!parsed.appearance_findings || typeof parsed.appearance_findings !== "string") {
     parsed.appearance_findings = "none";
   }
   if (String(parsed.appearance_findings).trim() === "") parsed.appearance_findings = "none";
 
-  // enforce contract
-  parsed.clothing_color = "auto";
-  parsed.background = "auto";
-
   return parsed as VisualProfile;
 }
 
-function buildImagePromptFromProfile(profile: VisualProfile, caseId: number, background: string): string {
+function buildImagePromptFromProfile(profile: VisualProfile, caseId: number): string {
+  const background = String(profile.background);
   const knit = knitHint(profile.clothing_type);
+  const glamBlock = glamStyleBlock(profile.glam_level, profile.retouching);
+
   return `
-Photorealistic studio headshot, facing camera, mild happy expression.
-Background: ${background}. It must be VERY LIGHT grey only (never medium grey or dark), no blue tint.
+Photorealistic studio headshot, facing camera, mildly happy expression.
 Studio side lighting, DSLR 80mm full-frame look. Single person centered, shoulders and head in frame.
 No text, no logos, no watermark.
+
+Background MUST be: ${background}.
+- It must be VERY LIGHT neutral grey only (never medium grey or dark).
+- No blue tint. No colored backdrop.
 
 CRITICAL CONSTRAINT:
 - The subject MUST be ${profile.gender_presentation}. Do not generate the opposite.
 
+${glamBlock}
+
 IMPORTANT:
 - Clothing and accessories must match the profile below.
+- NO grey clothing. Do not match clothing color to background.
 - No logos, no badges, no insignia, no readable text on clothing.
-- Do not use grey clothing. Do not match clothing color to background.
+- Headshot-appropriate attire only; subtle cues, not costume.
 - ${knit || "Ensure clothing looks correct for the described type."}
 - Makeup must match the profile below.
 - If appearance findings are not "none", they MUST be visible and match exactly. Do not invent additional lesions.
@@ -472,6 +538,8 @@ Subject profile:
 - Facial features: ${profile.facial_features}
 - Visible facial findings: ${profile.appearance_findings}
 - Socioeconomic vibe: ${profile.socioeconomic}
+- Glam level: ${profile.glam_level}
+- Retouching: ${profile.retouching}
 - Clothing: ${profile.clothing_type} in ${profile.clothing_color}
 - Accessories: ${profile.accessories}
 - Grooming: ${profile.grooming}
@@ -481,6 +549,11 @@ Subject profile:
 Variation tag (do not render): V-${caseId}
 `.trim().replace(/\s+/g, " ");
 }
+
+/* -----------------------------
+   Image generation + verification
+   (gender + clothing adherence only)
+----------------------------- */
 
 async function generateHeadshotPngBase64(prompt: string): Promise<string> {
   const img = await withRetry(() =>
@@ -497,7 +570,6 @@ async function generateHeadshotPngBase64(prompt: string): Promise<string> {
   return first.b64_json as string;
 }
 
-// Vision checks: gender + clothing adherence
 async function visionYesNo(imageB64: string, question: string): Promise<boolean> {
   const resp = await withRetry(() =>
     openai.responses.create({
@@ -531,9 +603,8 @@ function clothingCheckQuestion(clothingType: string) {
   if (ct.includes("uniform")) return `Is the subject wearing a uniform-style shirt (without visible badges/logos)?`;
   if (ct.includes("blazer")) return `Is the subject wearing a blazer or smart jacket?`;
   if (ct.includes("button-down") || ct.includes("blouse")) return `Is the subject wearing a button-down shirt or blouse?`;
-  if (ct.includes("polo")) return `Is the subject wearing a polo shirt (plain, no logo)?`;
+  if (ct.includes("polo")) return `Is the subject wearing a plain polo shirt (no logo)?`;
   if (ct.includes("hoodie") || ct.includes("sweatshirt")) return `Is the subject wearing a hoodie or sweatshirt?`;
-  // generic fallback
   return `Does the clothing match this description: "${clothingType}"?`;
 }
 
@@ -563,6 +634,10 @@ async function generateVerifiedHeadshot(
 
   return { b64: last, attempts: 3, genderOk: lastGenderOk, clothingOk: lastClothingOk };
 }
+
+/* -----------------------------
+   Handler
+----------------------------- */
 
 function extractErr(e: any) {
   return {
@@ -603,15 +678,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         const profile = await makeProfile(caseText, caseId);
 
-        // deterministic background + clothing color (and avoid clash)
+        // Deterministic background + clothing color; ensure no clash
         const seed = seedFromText(caseId, caseText);
         const background = pick(BACKGROUNDS, seed);
-
         let clothingColor = pick(CLOTHING_COLORS, seed + 17);
         clothingColor = ensureNoBackgroundClothingClash(clothingColor, background);
 
-        profile.clothing_color = clothingColor;
         profile.background = background;
+        profile.clothing_color = clothingColor;
 
         if (debug) {
           return res.status(200).json({
@@ -623,7 +697,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           });
         }
 
-        const imagePrompt = buildImagePromptFromProfile(profile, caseId, background);
+        const imagePrompt = buildImagePromptFromProfile(profile, caseId);
 
         const gen = await generateVerifiedHeadshot(
           imagePrompt,
