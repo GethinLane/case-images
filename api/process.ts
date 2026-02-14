@@ -70,7 +70,7 @@ async function withRetry<T>(fn: () => Promise<T>, tries = 3): Promise<T> {
   throw lastErr;
 }
 
-// Airtable fields you listed (included first); we also include any extra fields present.
+// Airtable fields you listed; we include these first, then include any extra fields present too.
 const CASE_FIELDS = [
   "Name",
   "Age",
@@ -121,8 +121,7 @@ function buildRecordText(fields: Record<string, any>): string {
 }
 
 /**
- * Pull ALL records from "Case N" (up to 100) and concatenate into one text blob.
- * This ensures the model sees occupation, social history, hobbies, etc.
+ * Pull ALL records from "Case N" (up to 100) and concatenate.
  */
 async function getCaseText(caseId: number): Promise<{ tableName: string; caseText: string }> {
   const tableName = `Case ${caseId}`;
@@ -197,7 +196,7 @@ async function uploadPng(caseId: number, b64: string, overwrite: boolean): Promi
   return res.url;
 }
 
-// Deterministic selection so colors don’t collapse to beige/navy constantly.
+// Deterministic selection so clothing colors don’t collapse to one option.
 function seedFromText(caseId: number, text: string) {
   const h = crypto.createHash("sha256").update(`${caseId}::${text}`, "utf8").digest();
   return h.readUInt32BE(0);
@@ -205,8 +204,6 @@ function seedFromText(caseId: number, text: string) {
 function pick<T>(arr: readonly T[], seed: number): T {
   return arr[seed % arr.length];
 }
-
-// Allowed clothing colors; avoids yellow/red, keeps variety, still realistic.
 const CLOTHING_COLORS = [
   "white",
   "light grey",
@@ -225,20 +222,50 @@ type Socioeconomic = "affluent" | "average" | "struggling" | "homeless" | "unkno
 type VisualProfile = {
   gender_presentation: GenderPresentation;
   age: string;
+
+  // MUST be one of slim/average/stocky (code will normalize if model adds extra words)
   build: "slim" | "average" | "stocky";
+
   hair: string;
   eyes: string;
   facial_features: string;
 
   socioeconomic: Socioeconomic;
   clothing_type: string;
-  clothing_color: "auto" | string; // model must return "auto"; code assigns a real color
+  clothing_color: "auto" | string; // model returns "auto"; code assigns a real color
   accessories: string;
   grooming: string;
   style_context: string;
 
   notes: string;
 };
+
+// Normalizers to prevent “PROFILE_JSON_BAD_BUILD: average inferred”
+function normalizeBuild(raw: any): "slim" | "average" | "stocky" | null {
+  if (!raw) return null;
+  const s = String(raw).toLowerCase();
+  if (s.includes("slim")) return "slim";
+  if (s.includes("stocky")) return "stocky";
+  if (s.includes("average")) return "average";
+  return null;
+}
+
+function normalizeGender(raw: any): GenderPresentation | null {
+  if (!raw) return null;
+  const s = String(raw).toLowerCase();
+  if (s.includes("female")) return "female-presenting";
+  if (s.includes("male")) return "male-presenting";
+  return null;
+}
+
+function normalizeSocio(raw: any): Socioeconomic {
+  const s = String(raw || "").toLowerCase();
+  if (s.includes("homeless")) return "homeless";
+  if (s.includes("struggling")) return "struggling";
+  if (s.includes("affluent")) return "affluent";
+  if (s.includes("average")) return "average";
+  return "unknown";
+}
 
 async function makeProfile(caseText: string, caseId: number): Promise<VisualProfile> {
   const prompt = `
@@ -263,14 +290,16 @@ Return ONLY valid JSON with EXACTLY these keys:
 
 Rules:
 - Use explicit details from the text when present.
-- If missing, infer realistic defaults and include the word "inferred" inside the value.
+- If missing, infer realistic defaults.
+- IMPORTANT: For enum fields (gender_presentation, build, socioeconomic) output ONLY one of the allowed values (no extra words).
+  Put any "inferred" wording into notes/style_context instead.
 - gender_presentation:
   - If text explicitly indicates girl/woman/female or boy/man/male, follow that.
-  - Else infer from pronouns/context; if still unclear choose one and state "inferred" in notes.
-- BMI: do NOT output a numeric BMI unless height AND weight are explicitly present and you compute it; otherwise ignore BMI and set build.
+  - Else infer from pronouns/context; if unclear choose one and say "inferred" in notes.
+- BMI: do NOT output a numeric BMI unless height AND weight are explicitly present and you compute it; otherwise ignore BMI and just set build.
 
 Socioeconomic inference:
-- affluent: cues like executive roles, expensive hobbies, private care, large house, luxury car, etc.
+- affluent: executive roles, expensive hobbies, private care, large house, luxury car, etc.
 - struggling: unemployment, financial stress, unstable housing, poor access.
 - homeless: explicit mention of homelessness/shelter/rough sleeping.
 - otherwise average/unknown.
@@ -290,7 +319,7 @@ Clothing inference (headshot appropriate; subtle cues, not costume):
 - Avoid defaulting to a plain t-shirt if hobbies/occupation suggest a better choice.
 
 Accessories:
-- affluent: include 1 subtle accessory (e.g., simple necklace OR small earrings OR a watch).
+- affluent: include 1 subtle accessory (simple necklace OR small earrings OR a watch).
 - average: optional simple accessory, otherwise "none".
 - struggling/homeless: usually "none" unless text suggests otherwise.
 
@@ -303,6 +332,7 @@ Safety constraints:
 - No logos, no badges, no insignia, no readable text.
 - Do NOT include the person’s name.
 - Do NOT infer country/ethnicity from the name. If explicitly mentioned, put it in notes only.
+- For clothing_color ALWAYS output exactly "auto" (do not choose a color).
 
 Deterministic key (do not output): CASE_ID=${caseId}
 
@@ -319,14 +349,14 @@ ${caseText}
 
   const raw = (resp.output_text || "").trim();
 
-  // Robust JSON extraction
   const firstBrace = raw.indexOf("{");
   const lastBrace = raw.lastIndexOf("}");
   if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
     throw new Error(`PROFILE_JSON_PARSE_FAILED: ${raw.slice(0, 240)}`);
   }
+
   const jsonText = raw.slice(firstBrace, lastBrace + 1);
-  const parsed = JSON.parse(jsonText);
+  const parsed: any = JSON.parse(jsonText);
 
   const requiredKeys = [
     "gender_presentation",
@@ -347,15 +377,16 @@ ${caseText}
     if (!(k in parsed)) throw new Error(`PROFILE_JSON_MISSING_KEY:${k}`);
   }
 
-  if (!["female-presenting", "male-presenting"].includes(parsed.gender_presentation)) {
-    throw new Error(`PROFILE_JSON_BAD_GENDER:${String(parsed.gender_presentation)}`);
-  }
-  if (!["slim", "average", "stocky"].includes(parsed.build)) {
-    throw new Error(`PROFILE_JSON_BAD_BUILD:${String(parsed.build)}`);
-  }
-  if (!["affluent", "average", "struggling", "homeless", "unknown"].includes(parsed.socioeconomic)) {
-    throw new Error(`PROFILE_JSON_BAD_SOCIOECONOMIC:${String(parsed.socioeconomic)}`);
-  }
+  // Normalize enums (prevents failures when model adds "inferred" etc.)
+  const ng = normalizeGender(parsed.gender_presentation);
+  if (!ng) throw new Error(`PROFILE_JSON_BAD_GENDER:${String(parsed.gender_presentation)}`);
+  parsed.gender_presentation = ng;
+
+  const nb = normalizeBuild(parsed.build);
+  if (!nb) throw new Error(`PROFILE_JSON_BAD_BUILD:${String(parsed.build)}`);
+  parsed.build = nb;
+
+  parsed.socioeconomic = normalizeSocio(parsed.socioeconomic);
 
   // enforce contract: model must not pick a color
   if (String(parsed.clothing_color).toLowerCase() !== "auto") {
@@ -392,8 +423,7 @@ Subject profile:
 - Clothing: ${profile.clothing_type} in ${profile.clothing_color}
 - Accessories: ${profile.accessories}
 - Grooming: ${profile.grooming}
-
-Style context: ${profile.style_context}
+- Style context: ${profile.style_context}
 
 Variation tag (do not render): V-${caseId}
 `.trim().replace(/\s+/g, " ");
@@ -414,7 +444,6 @@ async function generateHeadshotPngBase64(prompt: string): Promise<string> {
   return first.b64_json as string;
 }
 
-// Vision verification to reduce “girl profile but man image” failures.
 async function verifyGenderPresentation(imageB64: string, expected: GenderPresentation): Promise<boolean> {
   const checkPrompt = `
 Look at this headshot image and answer ONLY "yes" or "no".
@@ -470,13 +499,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const limit = Number(req.query.limit ?? 2);
     const maxCase = Number(MAX_CASE_ID ?? maxCaseDefault);
 
-    // dryRun=1 => no OpenAI calls, no blob writes (just Airtable reads)
     const dryRun = String(req.query.dryRun ?? "0") === "1";
-
-    // overwrite=1 => regenerate even if blob files exist
     const overwrite = String(req.query.overwrite ?? "0") === "1";
-
-    // debug=1 => return caseText preview + profile JSON for first case only (no image)
     const debug = String(req.query.debug ?? "0") === "1";
 
     const processed: any[] = [];
@@ -499,7 +523,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         const profile = await makeProfile(caseText, caseId);
 
-        // Deterministically assign a clothing color so it won’t collapse to navy/beige
+        // deterministic clothing color chosen from palette
         const seed = seedFromText(caseId, caseText);
         profile.clothing_color = pick(CLOTHING_COLORS, seed);
 
@@ -515,7 +539,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         const imagePrompt = buildImagePromptFromProfile(profile, caseId);
 
-        // Generate + verify + retry (helps enforce gender presentation)
         const b64 = await generateVerifiedHeadshot(imagePrompt, profile.gender_presentation);
 
         const imageUrl = await uploadPng(caseId, b64, overwrite);
