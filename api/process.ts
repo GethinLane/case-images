@@ -330,16 +330,15 @@ type Retouching = "none" | "light";
 type SkinTone = "very_light" | "light" | "medium" | "dark" | "very_dark" | "unspecified";
 type HairTexture = "straight" | "wavy" | "curly" | "coily" | "unspecified";
 
-/** NEW: composition support */
+/** composition support */
 type Composition = "single" | "pair";
 type CompanionProfile = {
-  role: string; // mother/father/guardian/carer/partner/interpreter/etc
+  role: string;
   gender_presentation: GenderPresentation;
-  age: string; // "adult" etc
+  age: string;
   notes: string;
 };
 
-/** NOTE: everything else kept as-is; new fields appended only */
 type VisualProfile = {
   gender_presentation: GenderPresentation;
   age: string;
@@ -349,17 +348,16 @@ type VisualProfile = {
   facial_features: string;
   appearance_findings: string;
 
-  // Explicit-only cultural fields (from text only; do not guess)
-  cultural_origin: string; // "unspecified" unless explicitly stated
-  ethnic_background: string; // "unspecified" unless explicitly stated
-  skin_tone: SkinTone; // "unspecified" unless explicitly stated
-  hair_texture: HairTexture; // "unspecified" unless explicitly stated
+  cultural_origin: string;
+  ethnic_background: string;
+  skin_tone: SkinTone;
+  hair_texture: HairTexture;
 
   socioeconomic: Socioeconomic;
   glam_level: GlamLevel;
   retouching: Retouching;
 
-  origin_cues: string; // "none" or the override string
+  origin_cues: string;
 
   clothing_type: string;
   clothing_color: "auto" | string;
@@ -372,7 +370,6 @@ type VisualProfile = {
 
   background: "auto" | string;
 
-  /** NEW */
   composition?: Composition;
   companion?: CompanionProfile | null;
 };
@@ -432,12 +429,61 @@ function normalizeExplicitString(raw: any): string {
   return s.length ? s : "unspecified";
 }
 
-/** NEW: simple age parsing to enforce child <6 => pair */
-function parseAgeNumber(ageStr: string): number | null {
-  const m = String(ageStr || "").match(/(\d{1,3})/);
-  if (!m) return null;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? n : null;
+/* -----------------------------
+   NEW: Proper age parsing (handles months/weeks/days)
+----------------------------- */
+function parseAgeYears(ageStr: string): number | null {
+  const s = String(ageStr || "").toLowerCase().trim();
+  if (!s) return null;
+
+  const numMatch = s.match(/(\d+(\.\d+)?)/);
+  if (!numMatch) return null;
+
+  const n = Number(numMatch[1]);
+  if (!Number.isFinite(n)) return null;
+
+  if (/(month|months|mo\b)/.test(s)) return n / 12;
+  if (/(week|weeks|wk\b|wks\b)/.test(s)) return n / 52;
+  if (/(day|days|d\b)/.test(s)) return n / 365;
+
+  return n; // default assume years
+}
+
+function forceChildPairIfNeeded(profile: VisualProfile) {
+  const ageY = parseAgeYears(profile.age);
+  if (ageY != null && ageY < 6) {
+    profile.composition = "pair";
+    if (!profile.companion) {
+      profile.companion = {
+        role: "parent/guardian",
+        gender_presentation: "female-presenting",
+        age: "adult",
+        notes: "child under 6 must be accompanied",
+      };
+    }
+  }
+}
+
+/** NEW: If infant (<1y), make it unmistakable and enforce pair */
+function enforceInfantPrimary(profile: VisualProfile) {
+  const ageY = parseAgeYears(profile.age);
+  if (ageY != null && ageY < 1) {
+    const months = Math.max(0, Math.round(ageY * 12));
+    profile.age = months > 0 ? `${months} months old infant` : `infant under 1 year`;
+    profile.composition = "pair";
+    if (!profile.companion) {
+      profile.companion = {
+        role: "parent/guardian",
+        gender_presentation: "female-presenting",
+        age: "adult",
+        notes: "infant must be accompanied by an adult guardian",
+      };
+    } else {
+      // keep companion but strengthen notes
+      profile.companion.notes = (profile.companion.notes ? profile.companion.notes + "; " : "") +
+        "infant must be accompanied by an adult guardian";
+    }
+  }
 }
 
 function glamStyleBlock(glam: GlamLevel, retouching: Retouching) {
@@ -619,9 +665,6 @@ ${caseText}
 
 /* -----------------------------
    NEW: Scan + decision for TWO-person headshots
-   - child under ~6 => must be "pair" with adult guardian
-   - someone present / speaking on behalf => "pair"
-   (AI-based, not keyword search)
 ----------------------------- */
 
 type CompositionDecision = {
@@ -721,21 +764,6 @@ ${caseText}
   return parsed as CompositionDecision;
 }
 
-function forceChildPairIfNeeded(profile: VisualProfile) {
-  const ageN = parseAgeNumber(profile.age);
-  if (ageN != null && ageN < 6) {
-    profile.composition = "pair";
-    if (!profile.companion) {
-      profile.companion = {
-        role: "parent/guardian",
-        gender_presentation: "female-presenting",
-        age: "adult",
-        notes: "child under 6 must be accompanied",
-      };
-    }
-  }
-}
-
 function buildImagePromptFromProfile(profile: VisualProfile, caseId: number): string {
   const background = String(profile.background);
   const knit = knitHint(profile.clothing_type);
@@ -760,7 +788,6 @@ function buildImagePromptFromProfile(profile: VisualProfile, caseId: number): st
     ? `Phenotype constraints (explicit only): ${phenotypeParts.join(", ")}.`
     : `Phenotype constraints: unspecified (do not guess).`;
 
-  /** NEW: composition block (single vs pair) */
   const isPair = profile.composition === "pair" && !!profile.companion;
 
   const compositionBlock = isPair
@@ -904,7 +931,7 @@ ${caseText}
 }
 
 /* -----------------------------
-   Image generation + verification (gender + clothing only)
+   Image generation + verification
 ----------------------------- */
 
 async function generateHeadshotPngBase64(prompt: string): Promise<string> {
@@ -960,12 +987,17 @@ function clothingCheckQuestion(clothingType: string) {
   return `Does the PRIMARY subject's clothing match this description: "${clothingType}"?`;
 }
 
-/** NEW: checks for person count + child/adult pairing */
 async function verifyPersonCount(imageB64: string, expected: 1 | 2) {
   return visionYesNo(imageB64, `Are there exactly ${expected} people visible in the image?`);
 }
+
 async function verifyChildAndAdult(imageB64: string) {
   return visionYesNo(imageB64, `Is there one young child (toddler/preschool age) and one adult visible?`);
+}
+
+/** NEW: infant-specific verifier */
+async function verifyInfantAndAdult(imageB64: string) {
+  return visionYesNo(imageB64, `Is there one infant (baby under 1 year old) and one adult visible?`);
 }
 
 async function generateVerifiedHeadshot(
@@ -973,7 +1005,8 @@ async function generateVerifiedHeadshot(
   expectedGender: GenderPresentation,
   clothingType: string,
   expectedPeople: 1 | 2,
-  requireChildAdult: boolean
+  requireChildAdult: boolean,
+  requireInfantAdult: boolean
 ): Promise<{
   b64: string;
   attempts: number;
@@ -986,7 +1019,7 @@ async function generateVerifiedHeadshot(
   let lastPeopleOk = false;
   let lastGenderOk = false;
   let lastClothingOk = false;
-  let lastChildAdultOk = !requireChildAdult;
+  let lastChildAdultOk = !(requireChildAdult || requireInfantAdult);
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const b64 = await generateHeadshotPngBase64(prompt);
@@ -997,7 +1030,13 @@ async function generateVerifiedHeadshot(
     const peopleOk = await verifyPersonCount(b64, expectedPeople);
     const genderOk = peopleOk ? await verifyGender(b64, expectedGender) : false;
     const clothingOk = peopleOk ? await visionYesNo(b64, clothingCheckQuestion(clothingType)) : false;
-    const childAdultOk = requireChildAdult ? (peopleOk ? await verifyChildAndAdult(b64) : false) : true;
+
+    const childAdultOk =
+      requireInfantAdult
+        ? (peopleOk ? await verifyInfantAndAdult(b64) : false)
+        : requireChildAdult
+          ? (peopleOk ? await verifyChildAndAdult(b64) : false)
+          : true;
 
     lastPeopleOk = peopleOk;
     lastGenderOk = genderOk;
@@ -1042,10 +1081,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const overwrite = String(req.query.overwrite ?? "0") === "1";
     const debug = String(req.query.debug ?? "0") === "1";
 
-    // NEW: scan mode (no images). Finds explicit non-UK/mixed origin mentioned in case text.
     const scanOrigin = String(req.query.scanOrigin ?? "0") === "1";
-
-    // NEW: scan mode (no images). Finds cases that require TWO-person headshot.
     const scanPair = String(req.query.scanPair ?? "0") === "1";
 
     const endAt = Number(req.query.endAt ?? maxCase);
@@ -1113,7 +1149,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    /** NEW: scanPair mode (NO images / NO blob writes) */
     if (scanPair) {
       const pair: any[] = [];
       const single: any[] = [];
@@ -1128,13 +1163,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             continue;
           }
 
-          // use profile age as the deterministic child<6 rule enforcement
           const profile = await makeProfile(caseText, caseId);
           const comp = await decideComposition(caseText, caseId);
 
           let composition: "single" | "pair" = comp.composition;
-          const ageN = parseAgeNumber(profile.age);
-          if (ageN != null && ageN < 6) composition = "pair";
+
+          const ageY = parseAgeYears(profile.age);
+          if (ageY != null && ageY < 6) composition = "pair";
 
           const row = {
             caseId,
@@ -1192,11 +1227,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         const profile = await makeProfile(caseText, caseId);
 
-        // NEW: decide composition + enforce child<6 => pair
         const comp = await decideComposition(caseText, caseId);
         profile.composition = comp.composition;
         profile.companion = comp.companion;
+
+        // NEW: enforce child / infant rules correctly
         forceChildPairIfNeeded(profile);
+        enforceInfantPrimary(profile);
 
         // Deterministic background + clothing color; ensure no clash
         const seed = seedFromText(caseId, caseText);
@@ -1220,19 +1257,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         const imagePrompt = buildImagePromptFromProfile(profile, caseId);
 
-        // NEW: expected people (1 or 2) + child/adult check for <6
         const isPair = profile.composition === "pair" && !!profile.companion;
         const expectedPeople: 1 | 2 = isPair ? 2 : 1;
 
-        const ageN = parseAgeNumber(profile.age);
-        const requireChildAdult = ageN != null && ageN < 6;
+        const ageY = parseAgeYears(profile.age);
+        const requireInfantAdult = ageY != null && ageY < 1;
+        const requireChildAdult = ageY != null && ageY < 6;
 
         const gen = await generateVerifiedHeadshot(
           imagePrompt,
           profile.gender_presentation,
           profile.clothing_type,
           expectedPeople,
-          requireChildAdult
+          requireChildAdult,
+          requireInfantAdult
         );
 
         const imageUrl = await uploadPng(caseId, gen.b64, overwrite);
