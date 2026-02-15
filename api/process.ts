@@ -417,16 +417,11 @@ Rules:
 - clothing_color MUST be exactly "auto".
 - background MUST be exactly "auto".
 - Do NOT include the person’s name.
-- Do NOT infer country/ethnicity from the name.
+- you CAN infer country/ethnicity from the name.
 
 Cultural/ethnic representation (CRITICAL):
-- ONLY set cultural_origin / ethnic_background / skin_tone / hair_texture if explicitly stated in TEXT.
-- If NOT explicitly stated, set:
-  - cultural_origin = "unspecified"
-  - ethnic_background = "unspecified"
-  - skin_tone = "unspecified"
-  - hair_texture = "unspecified"
-- Do NOT guess origin/ethnicity.
+- set cultural_origin / ethnic_background / skin_tone / hair_texture if stated in TEXT.
+- Please guess origin/ethnicity.
 - Do NOT add traditional clothing unless explicitly stated.
 
 Appearance findings (CRITICAL):
@@ -627,7 +622,7 @@ Return ONLY valid JSON with EXACTLY these keys:
 
 Rules (CRITICAL):
 - ONLY use information explicitly stated in the TEXT. Do NOT guess.
-- Do NOT infer nationality/ethnicity from the patient's name.
+- you CAN infer nationality/ethnicity from the patient's name.
 - Do NOT infer from diagnosis alone (e.g. FGM does NOT automatically mean Nigeria).
 - If the text explicitly mentions any country/region/cultural origin, list it in origins_mentioned.
 - origin_status meanings:
