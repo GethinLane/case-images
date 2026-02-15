@@ -91,7 +91,6 @@ const CASE_ORIGIN_OVERRIDES: Record<number, string> = {
   146: "Francophone appearance cues (French/Francophone)",
 };
 
-
 function getHeader(req: VercelRequest, name: string): string | undefined {
   const v = req.headers[name.toLowerCase()];
   if (Array.isArray(v)) return v[0];
@@ -331,6 +330,16 @@ type Retouching = "none" | "light";
 type SkinTone = "very_light" | "light" | "medium" | "dark" | "very_dark" | "unspecified";
 type HairTexture = "straight" | "wavy" | "curly" | "coily" | "unspecified";
 
+/** NEW: composition support */
+type Composition = "single" | "pair";
+type CompanionProfile = {
+  role: string; // mother/father/guardian/carer/partner/interpreter/etc
+  gender_presentation: GenderPresentation;
+  age: string; // "adult" etc
+  notes: string;
+};
+
+/** NOTE: everything else kept as-is; new fields appended only */
 type VisualProfile = {
   gender_presentation: GenderPresentation;
   age: string;
@@ -351,8 +360,6 @@ type VisualProfile = {
   retouching: Retouching;
 
   origin_cues: string; // "none" or the override string
-  skin_tone: string;   // "light|light-medium|medium|medium-dark|dark" or descriptive
-
 
   clothing_type: string;
   clothing_color: "auto" | string;
@@ -364,6 +371,10 @@ type VisualProfile = {
   notes: string;
 
   background: "auto" | string;
+
+  /** NEW */
+  composition?: Composition;
+  companion?: CompanionProfile | null;
 };
 
 // Normalizers
@@ -419,6 +430,14 @@ function normalizeHairTexture(raw: any): HairTexture {
 function normalizeExplicitString(raw: any): string {
   const s = String(raw ?? "").trim();
   return s.length ? s : "unspecified";
+}
+
+/** NEW: simple age parsing to enforce child <6 => pair */
+function parseAgeNumber(ageStr: string): number | null {
+  const m = String(ageStr || "").match(/(\d{1,3})/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
 }
 
 function glamStyleBlock(glam: GlamLevel, retouching: Retouching) {
@@ -598,6 +617,125 @@ ${caseText}
   return parsed as VisualProfile;
 }
 
+/* -----------------------------
+   NEW: Scan + decision for TWO-person headshots
+   - child under ~6 => must be "pair" with adult guardian
+   - someone present / speaking on behalf => "pair"
+   (AI-based, not keyword search)
+----------------------------- */
+
+type CompositionDecision = {
+  composition: "single" | "pair";
+  reason: string;
+  evidence: string;
+  confidence: "high" | "medium" | "low";
+  companion: null | {
+    role: string;
+    gender_presentation: GenderPresentation;
+    age: string;
+    notes: string;
+  };
+};
+
+async function decideComposition(caseText: string, caseId: number): Promise<CompositionDecision> {
+  const prompt = `
+You are deciding whether a synthetic patient headshot should include ONE person or TWO people.
+
+Return ONLY valid JSON with EXACTLY these keys:
+{
+  "composition": "single|pair",
+  "reason": "...",
+  "evidence": "...",
+  "confidence": "high|medium|low",
+  "companion": null OR {
+    "role": "...",
+    "gender_presentation": "female-presenting|male-presenting",
+    "age": "...",
+    "notes": "..."
+  }
+}
+
+Rules (CRITICAL):
+- Use AI understanding, NOT keyword matching.
+- Base decisions ONLY on what is stated or clearly implied by the TEXT.
+- If the case subject is a child under ~6 years old, composition MUST be "pair" with an adult guardian present.
+- If the TEXT indicates someone is present with them OR speaking on their behalf (e.g., parent, guardian, carer, partner, interpreter), composition MUST be "pair".
+- If uncertain, prefer "single" unless it's a small child where you must choose "pair".
+- "evidence" should be a short pointer (max 180 chars) referencing the relevant statement(s).
+- Companion:
+  - role should be plain (mother/father/guardian/carer/partner/interpreter/etc).
+  - gender_presentation: choose based on text if possible; if not explicit, choose the most plausible but lower confidence.
+  - age: if not explicit, use "adult".
+
+Deterministic key (do not output): CASE_ID=${caseId}
+
+TEXT:
+${caseText}
+  `.trim();
+
+  const resp = await withRetry(() =>
+    openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: prompt,
+    })
+  );
+
+  const raw = (resp.output_text || "").trim();
+  const firstBrace = raw.indexOf("{");
+  const lastBrace = raw.lastIndexOf("}");
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    throw new Error(`COMPOSITION_JSON_PARSE_FAILED: ${raw.slice(0, 240)}`);
+  }
+
+  const parsed: any = JSON.parse(raw.slice(firstBrace, lastBrace + 1));
+
+  const allowedComp = new Set(["single", "pair"]);
+  const allowedConf = new Set(["high", "medium", "low"]);
+
+  if (!allowedComp.has(parsed.composition)) parsed.composition = "single";
+  if (!allowedConf.has(parsed.confidence)) parsed.confidence = "low";
+
+  parsed.reason = String(parsed.reason || "").trim().slice(0, 240);
+  parsed.evidence = String(parsed.evidence || "").trim().slice(0, 180);
+
+  if (parsed.composition === "pair") {
+    if (!parsed.companion || typeof parsed.companion !== "object") {
+      parsed.companion = {
+        role: "guardian",
+        gender_presentation: "female-presenting",
+        age: "adult",
+        notes: "present with patient",
+      };
+      if (parsed.confidence === "high") parsed.confidence = "medium";
+    } else {
+      parsed.companion.role = String(parsed.companion.role || "guardian").trim().slice(0, 60);
+      parsed.companion.gender_presentation =
+        normalizeGender(parsed.companion.gender_presentation) || "female-presenting";
+      parsed.companion.age = String(parsed.companion.age || "adult").trim().slice(0, 40);
+      parsed.companion.notes = String(parsed.companion.notes || "").trim().slice(0, 160);
+    }
+  } else {
+    parsed.companion = null;
+  }
+
+  return parsed as CompositionDecision;
+}
+
+function forceChildPairIfNeeded(profile: VisualProfile) {
+  const ageN = parseAgeNumber(profile.age);
+  if (ageN != null && ageN < 6) {
+    profile.composition = "pair";
+    if (!profile.companion) {
+      profile.companion = {
+        role: "parent/guardian",
+        gender_presentation: "female-presenting",
+        age: "adult",
+        notes: "child under 6 must be accompanied",
+      };
+    }
+  }
+}
+
 function buildImagePromptFromProfile(profile: VisualProfile, caseId: number): string {
   const background = String(profile.background);
   const knit = knitHint(profile.clothing_type);
@@ -611,10 +749,9 @@ function buildImagePromptFromProfile(profile: VisualProfile, caseId: number): st
       : `Cultural context: unspecified (do not guess).`;
 
   const originOverride = CASE_ORIGIN_OVERRIDES[caseId];
-const originLine = originOverride
-  ? `Origin/appearance guidance: ${originOverride}. Reflect this through plausible skin tone range, facial features, and hair traits.`
-  : `Origin/appearance guidance: none.`;
-
+  const originLine = originOverride
+    ? `Origin/appearance guidance: ${originOverride}. Reflect this through plausible skin tone range, facial features, and hair traits.`
+    : `Origin/appearance guidance: none.`;
 
   const phenotypeParts: string[] = [];
   if (profile.skin_tone !== "unspecified") phenotypeParts.push(`Skin tone: ${profile.skin_tone}`);
@@ -623,9 +760,21 @@ const originLine = originOverride
     ? `Phenotype constraints (explicit only): ${phenotypeParts.join(", ")}.`
     : `Phenotype constraints: unspecified (do not guess).`;
 
+  /** NEW: composition block (single vs pair) */
+  const isPair = profile.composition === "pair" && !!profile.companion;
+
+  const compositionBlock = isPair
+    ? `COMPOSITION (CRITICAL): Render EXACTLY TWO people. Person A is the PRIMARY patient (described below). Person B is a COMPANION: ${
+        profile.companion!.role
+      }, ${profile.companion!.gender_presentation}, age ${profile.companion!.age}. Both faces fully visible, head-and-shoulders framing for both. PRIMARY is slightly more prominent. No extra people.`
+    : `COMPOSITION (CRITICAL): Render EXACTLY ONE person only (the PRIMARY patient). No other people.`;
+
   return `
 Photorealistic studio headshot, facing camera, mildly happy expression.
-Studio side lighting, DSLR 80mm full-frame look. Single person centered, shoulders and head in frame.
+Studio side lighting, DSLR 80mm full-frame look. Single scene centered, shoulders and head in frame.
+
+${compositionBlock}
+
 No text, no logos, no watermark.
 
 Background MUST be: ${background}.
@@ -633,27 +782,28 @@ Background MUST be: ${background}.
 - No blue tint. No colored backdrop.
 
 CRITICAL CONSTRAINT:
-- The subject MUST be ${profile.gender_presentation}. Do not generate the opposite.
+- The PRIMARY subject MUST be ${profile.gender_presentation}. Do not generate the opposite.
 
 ${glamBlock}
 
 CULTURAL APPROPRIATENESS (IMPORTANT):
 - ${cultureLine}
+- ${originLine}
 - ${phenotypeLine}
 - Do NOT caricature or exaggerate features.
 - Keep styling contemporary and natural.
 - Do NOT add traditional clothing unless explicitly stated.
 
 IMPORTANT:
-- Clothing and accessories must match the profile below.
+- Clothing and accessories must match the PRIMARY profile below.
 - NO grey clothing. Do not match clothing color to background.
 - No logos, no badges, no insignia, no readable text on clothing.
 - Headshot-appropriate attire only; subtle cues, not costume.
 - ${knit || "Ensure clothing looks correct for the described type."}
-- Makeup must match the profile below.
+- Makeup must match the PRIMARY profile below.
 - If appearance findings are not "none", they MUST be visible and match exactly. Do not invent additional lesions.
 
-Subject profile:
+PRIMARY subject profile:
 - Gender presentation: ${profile.gender_presentation}
 - Age: ${profile.age}
 - Build: ${profile.build}
@@ -675,6 +825,8 @@ Subject profile:
 - Grooming: ${profile.grooming}
 - Makeup: ${profile.makeup}
 - Style context: ${profile.style_context}
+
+${isPair ? `COMPANION notes: ${profile.companion!.notes}` : ""}
 
 Variation tag (do not render): V-${caseId}
 `.trim().replace(/\s+/g, " ");
@@ -791,31 +943,50 @@ async function visionYesNo(imageB64: string, question: string): Promise<boolean>
 }
 
 async function verifyGender(imageB64: string, expected: GenderPresentation) {
-  return visionYesNo(imageB64, `Is the subject clearly ${expected}?`);
+  return visionYesNo(imageB64, `Is the PRIMARY subject clearly ${expected}?`);
 }
 
 function clothingCheckQuestion(clothingType: string) {
   const ct = clothingType.toLowerCase();
   if (ct.includes("knit") || ct.includes("jumper") || ct.includes("cardigan") || ct.includes("sweater")) {
-    return `Is the subject wearing a knitted jumper/cardigan/sweater with visible knit texture?`;
+    return `Is the PRIMARY subject wearing a knitted jumper/cardigan/sweater with visible knit texture?`;
   }
-  if (ct.includes("scrubs")) return `Is the subject wearing scrubs (medical work attire)?`;
-  if (ct.includes("uniform")) return `Is the subject wearing a uniform-style shirt (without visible badges/logos)?`;
-  if (ct.includes("blazer")) return `Is the subject wearing a blazer or smart jacket?`;
-  if (ct.includes("button-down") || ct.includes("blouse")) return `Is the subject wearing a button-down shirt or blouse?`;
-  if (ct.includes("polo")) return `Is the subject wearing a plain polo shirt (no logo)?`;
-  if (ct.includes("hoodie") || ct.includes("sweatshirt")) return `Is the subject wearing a hoodie or sweatshirt?`;
-  return `Does the clothing match this description: "${clothingType}"?`;
+  if (ct.includes("scrubs")) return `Is the PRIMARY subject wearing scrubs (medical work attire)?`;
+  if (ct.includes("uniform")) return `Is the PRIMARY subject wearing a uniform-style shirt (without visible badges/logos)?`;
+  if (ct.includes("blazer")) return `Is the PRIMARY subject wearing a blazer or smart jacket?`;
+  if (ct.includes("button-down") || ct.includes("blouse")) return `Is the PRIMARY subject wearing a button-down shirt or blouse?`;
+  if (ct.includes("polo")) return `Is the PRIMARY subject wearing a plain polo shirt (no logo)?`;
+  if (ct.includes("hoodie") || ct.includes("sweatshirt")) return `Is the PRIMARY subject wearing a hoodie or sweatshirt?`;
+  return `Does the PRIMARY subject's clothing match this description: "${clothingType}"?`;
+}
+
+/** NEW: checks for person count + child/adult pairing */
+async function verifyPersonCount(imageB64: string, expected: 1 | 2) {
+  return visionYesNo(imageB64, `Are there exactly ${expected} people visible in the image?`);
+}
+async function verifyChildAndAdult(imageB64: string) {
+  return visionYesNo(imageB64, `Is there one young child (toddler/preschool age) and one adult visible?`);
 }
 
 async function generateVerifiedHeadshot(
   prompt: string,
   expectedGender: GenderPresentation,
-  clothingType: string
-): Promise<{ b64: string; attempts: number; genderOk: boolean; clothingOk: boolean }> {
+  clothingType: string,
+  expectedPeople: 1 | 2,
+  requireChildAdult: boolean
+): Promise<{
+  b64: string;
+  attempts: number;
+  peopleOk: boolean;
+  genderOk: boolean;
+  clothingOk: boolean;
+  childAdultOk: boolean;
+}> {
   let last = "";
+  let lastPeopleOk = false;
   let lastGenderOk = false;
   let lastClothingOk = false;
+  let lastChildAdultOk = !requireChildAdult;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const b64 = await generateHeadshotPngBase64(prompt);
@@ -823,16 +994,29 @@ async function generateVerifiedHeadshot(
 
     await sleep(150);
 
-    const genderOk = await verifyGender(b64, expectedGender);
-    const clothingOk = await visionYesNo(b64, clothingCheckQuestion(clothingType));
+    const peopleOk = await verifyPersonCount(b64, expectedPeople);
+    const genderOk = peopleOk ? await verifyGender(b64, expectedGender) : false;
+    const clothingOk = peopleOk ? await visionYesNo(b64, clothingCheckQuestion(clothingType)) : false;
+    const childAdultOk = requireChildAdult ? (peopleOk ? await verifyChildAndAdult(b64) : false) : true;
 
+    lastPeopleOk = peopleOk;
     lastGenderOk = genderOk;
     lastClothingOk = clothingOk;
+    lastChildAdultOk = childAdultOk;
 
-    if (genderOk && clothingOk) return { b64, attempts: attempt, genderOk, clothingOk };
+    if (peopleOk && genderOk && clothingOk && childAdultOk) {
+      return { b64, attempts: attempt, peopleOk, genderOk, clothingOk, childAdultOk };
+    }
   }
 
-  return { b64: last, attempts: 3, genderOk: lastGenderOk, clothingOk: lastClothingOk };
+  return {
+    b64: last,
+    attempts: 3,
+    peopleOk: lastPeopleOk,
+    genderOk: lastGenderOk,
+    clothingOk: lastClothingOk,
+    childAdultOk: lastChildAdultOk,
+  };
 }
 
 /* -----------------------------
@@ -860,6 +1044,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // NEW: scan mode (no images). Finds explicit non-UK/mixed origin mentioned in case text.
     const scanOrigin = String(req.query.scanOrigin ?? "0") === "1";
+
+    // NEW: scan mode (no images). Finds cases that require TWO-person headshot.
+    const scanPair = String(req.query.scanPair ?? "0") === "1";
+
     const endAt = Number(req.query.endAt ?? maxCase);
 
     if (scanOrigin) {
@@ -925,6 +1113,65 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
+    /** NEW: scanPair mode (NO images / NO blob writes) */
+    if (scanPair) {
+      const pair: any[] = [];
+      const single: any[] = [];
+      const errors: any[] = [];
+
+      for (let caseId = startFrom; caseId <= endAt; caseId++) {
+        try {
+          const { tableName, caseText } = await getCaseText(caseId);
+
+          if (!caseText.trim()) {
+            single.push({ caseId, tableName, composition: "single", reason: "no-text", confidence: "low", evidence: "" });
+            continue;
+          }
+
+          // use profile age as the deterministic child<6 rule enforcement
+          const profile = await makeProfile(caseText, caseId);
+          const comp = await decideComposition(caseText, caseId);
+
+          let composition: "single" | "pair" = comp.composition;
+          const ageN = parseAgeNumber(profile.age);
+          if (ageN != null && ageN < 6) composition = "pair";
+
+          const row = {
+            caseId,
+            tableName,
+            age: profile.age,
+            composition,
+            reason: comp.reason,
+            evidence: comp.evidence,
+            confidence: comp.confidence,
+            companion: composition === "pair" ? comp.companion : null,
+          };
+
+          if (composition === "pair") pair.push(row);
+          else single.push(row);
+
+          await sleep(80);
+        } catch (e: any) {
+          errors.push({ caseId, error: extractErr(e) });
+        }
+      }
+
+      return res.status(200).json({
+        ok: true,
+        scanPair: true,
+        startFrom,
+        endAt,
+        counts: {
+          pair: pair.length,
+          single: single.length,
+          errors: errors.length,
+        },
+        pair,
+        single,
+        errors,
+      });
+    }
+
     const processed: any[] = [];
 
     for (let caseId = startFrom; caseId <= maxCase; caseId++) {
@@ -945,6 +1192,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         const profile = await makeProfile(caseText, caseId);
 
+        // NEW: decide composition + enforce child<6 => pair
+        const comp = await decideComposition(caseText, caseId);
+        profile.composition = comp.composition;
+        profile.companion = comp.companion;
+        forceChildPairIfNeeded(profile);
+
         // Deterministic background + clothing color; ensure no clash
         const seed = seedFromText(caseId, caseText);
         const background = pick(BACKGROUNDS, seed);
@@ -961,15 +1214,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             tableName,
             caseTextPreview: caseText.slice(0, 2500),
             profile,
+            compositionDecision: comp,
           });
         }
 
         const imagePrompt = buildImagePromptFromProfile(profile, caseId);
 
+        // NEW: expected people (1 or 2) + child/adult check for <6
+        const isPair = profile.composition === "pair" && !!profile.companion;
+        const expectedPeople: 1 | 2 = isPair ? 2 : 1;
+
+        const ageN = parseAgeNumber(profile.age);
+        const requireChildAdult = ageN != null && ageN < 6;
+
         const gen = await generateVerifiedHeadshot(
           imagePrompt,
           profile.gender_presentation,
-          profile.clothing_type
+          profile.clothing_type,
+          expectedPeople,
+          requireChildAdult
         );
 
         const imageUrl = await uploadPng(caseId, gen.b64, overwrite);
@@ -982,8 +1245,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           imageUrl,
           generationChecks: {
             attempts: gen.attempts,
+            peopleOk: gen.peopleOk,
             genderOk: gen.genderOk,
             clothingOk: gen.clothingOk,
+            childAdultOk: gen.childAdultOk,
           },
           source: { tableName },
           image: { model: IMAGE_MODEL_USED, quality: IMAGE_QUALITY_USED, size: IMAGE_SIZE_USED },
