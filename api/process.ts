@@ -31,6 +31,67 @@ const IMAGE_MODEL_USED = IMAGE_MODEL || "gpt-image-1.5";
 const IMAGE_QUALITY_USED = (IMAGE_QUALITY || "high") as any;
 const IMAGE_SIZE_USED = (IMAGE_SIZE || "1024x1024") as any;
 
+const CASE_ORIGIN_OVERRIDES: Record<number, string> = {
+  // Iberian / Hispanic
+  9: "Iberian (Spanish) / Hispanic appearance cues",
+  52: "Iberian (Spanish) / Hispanic appearance cues",
+  69: "Iberian (Spanish) / Hispanic appearance cues",
+  36: "Iberian (Spanish) / Hispanic appearance cues",
+  126: "Iberian (Spanish) / Hispanic appearance cues",
+  340: "Iberian (Portuguese/Spanish) appearance cues",
+  341: "Iberian-language origin appearance cues (Portuguese/Spanish leaning)",
+  151: "Iberian (Spanish/Portuguese) appearance cues",
+
+  // South Asian
+  323: "South Asian appearance cues (India, Gujarati)",
+  325: "South Asian appearance cues (India, Gujarati)",
+  333: "South Asian appearance cues (India, Gujarati)",
+  337: "South Asian appearance cues (India, Gujarati)",
+  349: "South Asian appearance cues (India)",
+  112: "South Asian appearance cues (Pakistan/South Asia)",
+  220: "South/Central Asian appearance cues",
+  332: "South/Central Asian appearance cues",
+  170: "South/Central Asian appearance cues",
+  300: "South Asian / MENA-adjacent Muslim-community appearance cues",
+  129: "South Asian / MENA-adjacent Muslim-community appearance cues",
+  354: "South Asian / Muslim-community appearance cues",
+
+  // MENA / Maghreb
+  297: "Middle Eastern (Arab) appearance cues",
+  148: "North African / Maghreb appearance cues",
+  301: "Middle Eastern (Arab) appearance cues",
+
+  // West Africa (Nigeria)
+  272: "West African appearance cues (Nigeria)",
+  316: "West African appearance cues (Nigeria)",
+  350: "West African appearance cues (Nigeria)",
+
+  // Slavic / Eastern Europe
+  183: "Slavic / Eastern European appearance cues (South Slavic leaning)",
+  246: "Slavic / Eastern European appearance cues",
+  113: "Slavic/Russian-leaning appearance cues",
+
+  // East Asian
+  256: "East Asian appearance cues (Chinese-origin)",
+
+  // Italian
+  204: "Southern European appearance cues (Italian)",
+  190: "Southern European appearance cues (Italian)",
+  156: "Southern European appearance cues (Italian/Portuguese/Spanish leaning)",
+
+  // Germanic / Scandinavian
+  43: "Northern/Central European appearance cues (Germanic)",
+  110: "Northern/Central European appearance cues (Germanic)",
+  56: "Northern/Central European appearance cues (German/Jewish diaspora leaning)",
+  79: "Northern European appearance cues (Scandinavian)",
+  211: "Northern/Central European appearance cues (Germanic)",
+
+  // French / Francophone
+  299: "Francophone appearance cues (French/Caribbean possible)",
+  146: "Francophone appearance cues (French/Francophone)",
+};
+
+
 function getHeader(req: VercelRequest, name: string): string | undefined {
   const v = req.headers[name.toLowerCase()];
   if (Array.isArray(v)) return v[0];
@@ -289,6 +350,10 @@ type VisualProfile = {
   glam_level: GlamLevel;
   retouching: Retouching;
 
+  origin_cues: string; // "none" or the override string
+  skin_tone: string;   // "light|light-medium|medium|medium-dark|dark" or descriptive
+
+
   clothing_type: string;
   clothing_color: "auto" | string;
   accessories: string;
@@ -403,6 +468,8 @@ Return ONLY valid JSON with EXACTLY these keys:
   "clothing_type": "...",
   "clothing_color": "auto",
   "accessories": "...",
+  "origin_cues": "...",
+  "skin_tone": "...",
   "grooming": "...",
   "makeup": "...",
   "style_context": "...",
@@ -437,6 +504,16 @@ Clothing inference (headshot appropriate; subtle cues, not costume):
 
 Accessories/Grooming/Makeup:
 - Keep appropriate to socioeconomic + age; natural realism.
+
+Origin / appearance cues:
+- origin_cues should be "none" unless an override is provided by the system.
+- If origin_cues is provided, use it to guide plausible facial features + skin tone range.
+- Do not mention ethnicity labels in the final image (no text), this is only guidance.
+
+Skin tone:
+- Choose a plausible skin_tone description consistent with origin_cues if provided.
+- Otherwise infer from case context only; do not infer from name.
+
 
 Deterministic key (do not output): CASE_ID=${caseId}
 
@@ -532,6 +609,12 @@ function buildImagePromptFromProfile(profile: VisualProfile, caseId: number): st
           profile.ethnic_background !== "unspecified" ? `; ${profile.ethnic_background}` : ""
         }.`
       : `Cultural context: unspecified (do not guess).`;
+
+  const originOverride = CASE_ORIGIN_OVERRIDES[caseId];
+const originLine = originOverride
+  ? `Origin/appearance guidance: ${originOverride}. Reflect this through plausible skin tone range, facial features, and hair traits.`
+  : `Origin/appearance guidance: none.`;
+
 
   const phenotypeParts: string[] = [];
   if (profile.skin_tone !== "unspecified") phenotypeParts.push(`Skin tone: ${profile.skin_tone}`);
