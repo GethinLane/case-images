@@ -208,6 +208,14 @@ async function getCaseText(caseId: number): Promise<{ tableName: string; caseTex
     throw e;
   }
 }
+function extractAirtableAgeFromCaseText(caseText: string): string | null {
+  // Matches a line like: "Age: 6 months"
+  const m = caseText.match(/(?:^|\n)\s*Age\s*:\s*([^\n]+)/i);
+  if (!m) return null;
+  const v = String(m[1] || "").trim();
+  return v.length ? v : null;
+}
+
 
 /* -----------------------------
    Vercel Blob storage
@@ -1163,13 +1171,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             continue;
           }
 
-          const profile = await makeProfile(caseText, caseId);
-          const comp = await decideComposition(caseText, caseId);
+const profile = await makeProfile(caseText, caseId);
 
-          let composition: "single" | "pair" = comp.composition;
+// HARD LOCK: primary age must equal Airtable Age field (no LLM override)
+const airtableAge = extractAirtableAgeFromCaseText(caseText);
+if (airtableAge) profile.age = airtableAge;
 
-          const ageY = parseAgeYears(profile.age);
-          if (ageY != null && ageY < 6) composition = "pair";
+const comp = await decideComposition(caseText, caseId);
+
+let composition: "single" | "pair" = comp.composition;
+
+const ageY = parseAgeYears(profile.age);
+if (ageY != null && ageY < 6) composition = "pair";
+
 
           const row = {
             caseId,
@@ -1225,15 +1239,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           continue;
         }
 
-        const profile = await makeProfile(caseText, caseId);
+const profile = await makeProfile(caseText, caseId);
 
-        const comp = await decideComposition(caseText, caseId);
-        profile.composition = comp.composition;
-        profile.companion = comp.companion;
+// HARD LOCK: primary age must equal Airtable Age field (no LLM override)
+const airtableAge = extractAirtableAgeFromCaseText(caseText);
+if (airtableAge) profile.age = airtableAge;
 
-        // NEW: enforce child / infant rules correctly
-        forceChildPairIfNeeded(profile);
-        enforceInfantPrimary(profile);
+const comp = await decideComposition(caseText, caseId);
+profile.composition = comp.composition;
+profile.companion = comp.companion;
+
+// enforce child / infant rules correctly (now works for "6 months")
+forceChildPairIfNeeded(profile);
+enforceInfantPrimary(profile);
+
 
         // Deterministic background + clothing color; ensure no clash
         const seed = seedFromText(caseId, caseText);
