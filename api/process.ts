@@ -28,7 +28,7 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const airtable = new Airtable({ apiKey: AIRTABLE_TOKEN }).base(AIRTABLE_BASE_ID);
 
 const IMAGE_MODEL_USED = IMAGE_MODEL || "gpt-image-1.5";
-const IMAGE_QUALITY_USED = (IMAGE_QUALITY || "medium") as any;
+const IMAGE_QUALITY_USED = (IMAGE_QUALITY || "high") as any;
 const IMAGE_SIZE_USED = (IMAGE_SIZE || "1024x1024") as any;
 
 function getHeader(req: VercelRequest, name: string): string | undefined {
@@ -428,6 +428,7 @@ Appearance findings (CRITICAL):
 - Only include features visible in a headshot AND explicitly stated in the text.
 - If none explicitly stated, output "none".
 - Do NOT infer visible signs from diagnoses alone.
+- Do make clothing and appearance relevant to situation (such as homelessness, or extremely wealthy)
 
 Clothing inference (headshot appropriate; subtle cues, not costume):
 - Prefer clothing that fits occupation AND hobbies/lifestyle AND socioeconomic context.
