@@ -1,8 +1,0 @@
-{
-  "crons": [
-    {
-      "path": "/api/process?startFrom=1&limit=10",
-      "schedule": "0 2 * * *"
-    }
-  ]
-}
